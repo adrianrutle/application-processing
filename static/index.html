@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f4ef" />
+    <title>Application Review</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="wordmark" href="/" aria-label="Application Review home">
+        <span class="wordmark-mark">AR</span>
+        <span>APPLICATION<br />REVIEW</span>
+      </a>
+      <div class="model-status" id="model-status" role="status" aria-live="polite">
+        <span class="status-light"></span>
+        <span id="model-status-text">Checking local model</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="page-heading">
+        <div>
+          <p class="eyebrow">PRIVATE WORKSPACE <span> / </span> HUMAN REVIEW</p>
+          <h1>Application review</h1>
+          <p class="heading-copy">Compare submitted evidence with the requirements of the role.</p>
+        </div>
+        <div class="session-tag"><span class="session-dot"></span> Session-only workspace</div>
+      </section>
+
+      <div class="privacy-note" id="privacy-note">
+        <span class="privacy-icon" aria-hidden="true">LOCAL</span>
+        <p>Candidate documents are processed by the loopback model endpoint only. This app does not save submissions or send them to a cloud service.</p>
+      </div>
+
+      <section class="workspace" aria-label="Candidate review workspace">
+        <section class="work-column role-column" aria-labelledby="role-heading">
+          <div class="section-heading">
+            <span class="step-number">01</span>
+            <div>
+              <h2 id="role-heading">Role criteria</h2>
+              <p>Start with the published announcement.</p>
+            </div>
+          </div>
+          <span class="field-label">Announcement source</span>
+          <div class="source-modes" role="radiogroup" aria-label="Announcement source type">
+            <label><input type="radio" name="announcement-mode" value="text" checked /> Paste text</label>
+            <label><input type="radio" name="announcement-mode" value="pdf" /> PDF file</label>
+            <label><input type="radio" name="announcement-mode" value="url" /> HTTPS URL</label>
+          </div>
+          <div class="source-panel" id="announcement-text-panel">
+            <label class="visually-hidden" for="announcement">Job announcement text</label>
+            <textarea id="announcement" rows="7" placeholder="Paste the public job announcement"></textarea>
+          </div>
+          <div class="source-panel" id="announcement-pdf-panel" hidden>
+            <label class="file-drop announcement-file" for="announcement-pdf">
+              <span class="file-mark" aria-hidden="true">PDF</span>
+              <span class="file-copy">
+                <strong id="announcement-pdf-name">Choose announcement PDF</strong>
+                <span>Text-based PDF, up to 50 MB</span>
+              </span>
+              <span class="file-action">Browse</span>
+            </label>
+            <input class="visually-hidden" id="announcement-pdf" type="file" accept="application/pdf,.pdf" />
+          </div>
+          <div class="source-panel" id="announcement-url-panel" hidden>
+            <label class="field-label" for="announcement-url">Public HTTPS address</label>
+            <input id="announcement-url" type="url" inputmode="url" placeholder="https://example.org/jobs/role" />
+            <p class="source-hint">The address must be public, use HTTPS, and not redirect.</p>
+          </div>
+          <div class="button-row">
+            <button class="button button-primary" id="extract-criteria" type="button" disabled>Extract criteria</button>
+            <span class="inline-status" id="criteria-status" aria-live="polite"></span>
+          </div>
+
+          <div class="criteria-heading">
+            <div>
+              <h3>Review criteria</h3>
+              <p>Editable before you review applications.</p>
+            </div>
+            <button class="button button-quiet" id="add-criterion" type="button">Add criterion</button>
+          </div>
+          <div class="criteria-list" id="criteria-list">
+            <div class="empty-criteria">No criteria added yet.</div>
+          </div>
+        </section>
+
+        <section class="work-column candidate-column" aria-labelledby="candidate-heading">
+          <div class="section-heading">
+            <span class="step-number">02</span>
+            <div>
+              <h2 id="candidate-heading">Candidate document</h2>
+              <p>PDF or XML, one candidate per review.</p>
+            </div>
+          </div>
+
+          <label class="field-label" for="candidate-label">Candidate label</label>
+          <input id="candidate-label" type="text" maxlength="80" placeholder="For example, Application 01" />
+
+          <label class="file-drop" for="candidate-document">
+            <span class="file-mark" aria-hidden="true">FILE</span>
+            <span class="file-copy">
+              <strong id="file-name">Choose a PDF or XML</strong>
+              <span id="file-details">PDF page ranges are supported; XML citations use element paths</span>
+            </span>
+            <span class="file-action">Browse</span>
+          </label>
+          <input class="visually-hidden" id="candidate-document" type="file" accept="application/pdf,.pdf,application/xml,text/xml,.xml" />
+
+          <div class="page-range" id="page-range" hidden>
+            <div>
+              <span class="field-label">Candidate pages</span>
+              <span class="field-hint" id="page-count-label">PDF page range</span>
+            </div>
+            <label>From <input id="page-start" type="number" min="1" value="1" /></label>
+            <label>To <input id="page-end" type="number" min="1" value="1" /></label>
+          </div>
+
+          <div class="review-action">
+            <button class="button button-primary" id="review-candidate" type="button" disabled>Review candidate</button>
+            <span class="inline-status" id="review-status" aria-live="polite"></span>
+          </div>
+          <p class="privacy-footnote">Scanned PDFs need OCR first. Reviews are evidence notes, not hiring recommendations.</p>
+        </section>
+      </section>
+
+      <section class="results-section" aria-labelledby="results-heading">
+        <div class="results-header">
+          <div class="section-heading">
+            <span class="step-number">03</span>
+            <div>
+              <h2 id="results-heading">Review notes</h2>
+              <p>Evidence is shown with source page references.</p>
+            </div>
+          </div>
+          <button class="button button-quiet" id="clear-reviews" type="button" disabled>Clear reviews</button>
+        </div>
+        <div class="results-list" id="results-list">
+          <p class="empty-results">Candidate reviews will appear here.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>APPLICATION REVIEW <span class="footer-separator">/</span> LOCAL-FIRST</span>
+      <span id="endpoint-label">Model endpoint: checking</span>
+    </footer>
+    <div class="toast" id="toast" role="alert" hidden></div>
+  </body>
+</html>
