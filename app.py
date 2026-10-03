@@ -256,6 +256,13 @@ def is_loopback_endpoint(endpoint: str) -> bool:
         return False
 
 
+def is_allowed_model_endpoint(endpoint: str, provider: str) -> bool:
+    hostname = urlparse(endpoint).hostname
+    if provider == "lmstudio" and hostname == "host.docker.internal":
+        return True
+    return is_loopback_endpoint(endpoint)
+
+
 def is_ollama_cloud_model(model: str) -> bool:
     return model.casefold().endswith(":cloud")
 
@@ -276,7 +283,7 @@ async def local_model_json(messages: list[dict]) -> dict:
     provider, base_url, configured_model = local_model_settings()
     if provider not in {"ollama", "lmstudio"}:
         raise HTTPException(status_code=503, detail="Set LLM_PROVIDER to 'ollama' or 'lmstudio'.")
-    if not is_loopback_endpoint(base_url):
+    if not is_allowed_model_endpoint(base_url, provider):
         raise HTTPException(
             status_code=403,
             detail="Candidate data is sent only to a loopback model endpoint. Check the local model URL setting.",
@@ -362,7 +369,7 @@ async def index():
 async def status():
     provider, base_url, configured_model = local_model_settings()
     cloud_model_blocked = provider == "ollama" and is_ollama_cloud_model(configured_model)
-    endpoint_is_local = bool(base_url) and is_loopback_endpoint(base_url)
+    endpoint_is_local = bool(base_url) and is_allowed_model_endpoint(base_url, provider)
     status_data = {
         "connected": False,
         "model_available": False,

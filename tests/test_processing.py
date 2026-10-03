@@ -12,6 +12,7 @@ from app import (
     extract_pdf_pages,
     extract_xml_sources,
     fetch_public_announcement,
+    is_allowed_model_endpoint,
     is_loopback_endpoint,
     is_ollama_cloud_model,
     lm_studio_model_ids,
@@ -80,6 +81,12 @@ class PdfProcessingTests(unittest.TestCase):
         self.assertTrue(is_loopback_endpoint("http://127.0.0.1:11434"))
         self.assertTrue(is_loopback_endpoint("http://localhost:11434"))
         self.assertFalse(is_loopback_endpoint("https://example.com"))
+
+    def test_docker_host_gateway_only_allowed_for_lm_studio(self):
+        endpoint = "http://host.docker.internal:1234/v1"
+        self.assertTrue(is_allowed_model_endpoint(endpoint, "lmstudio"))
+        self.assertFalse(is_allowed_model_endpoint(endpoint, "ollama"))
+        self.assertFalse(is_allowed_model_endpoint("https://example.com/v1", "lmstudio"))
 
     def test_blocks_ollama_cloud_models(self):
         self.assertTrue(is_ollama_cloud_model("example:cloud"))

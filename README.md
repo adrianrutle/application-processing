@@ -33,6 +33,18 @@ LLM_PROVIDER=lmstudio LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1 uvicorn app:ap
 
 The app discovers the model ID from LM Studio. If more than one model is available, set `LM_STUDIO_MODEL` to the ID shown by `curl http://127.0.0.1:1234/v1/models`. The app uses LM Studio's OpenAI-compatible chat-completions API with JSON response mode and blocks non-loopback model URLs.
 
+### Docker on macOS
+
+Docker Desktop can run the app while LM Studio stays installed on the Mac. In LM Studio, load Qwen and start the local server on port `1234`. From this project directory on the Mac, run:
+
+```sh
+docker compose up --build
+```
+
+Open <http://127.0.0.1:8000>. Docker Desktop routes `host.docker.internal` from the app container to the Mac's LM Studio server. The app accepts that host gateway only for LM Studio; the web UI port is published on the Mac's loopback interface only. Stop it with `Ctrl+C`.
+
+If your LM Studio server requires an API key, export `LM_STUDIO_API_KEY` in the same terminal before starting Compose. To select a specific loaded model, export `LM_STUDIO_MODEL` to its ID first. Do not enable LM Studio's network-wide access unless required; `host.docker.internal` is intended to connect the container to the Mac host.
+
 ## Review flow
 
 1. Paste an announcement, upload its PDF, or enter its public HTTPS URL; extract criteria with the local model.
