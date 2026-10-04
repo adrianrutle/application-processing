@@ -10,6 +10,7 @@ from pypdf import PdfWriter
 from app import (
     app,
     CriteriaResponse,
+    decode_model_json,
     extract_pdf_pages,
     extract_xml_sources,
     fetch_public_announcement,
@@ -100,6 +101,18 @@ class PdfProcessingTests(unittest.TestCase):
             lm_studio_model_ids({"data": [{"id": "qwen-local"}, {"name": "ignored"}]}),
             ["qwen-local"],
         )
+
+    def test_model_json_decoder_reports_malformed_content_without_echoing_it(self):
+        with self.assertRaises(HTTPException) as error:
+            decode_model_json("not json", "LM Studio")
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertIn("invalid JSON", error.exception.detail)
+        self.assertNotIn("not json", error.exception.detail)
+
+    def test_model_json_decoder_requires_object(self):
+        with self.assertRaises(HTTPException) as error:
+            decode_model_json("[]", "LM Studio")
+        self.assertIn("not an object", error.exception.detail)
 
     def test_lm_studio_uses_openai_compatible_json_api(self):
         with (

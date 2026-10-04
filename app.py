@@ -284,6 +284,21 @@ def lm_studio_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
+def decode_model_json(content, label: str) -> dict:
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(status_code=502, detail=f"{label} returned empty or non-text response content.")
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{label} returned invalid JSON (line {exc.lineno}, column {exc.colno}).",
+        ) from exc
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail=f"{label} returned JSON that was not an object.")
+    return result
+
+
 async def local_model_json(messages: list[dict], response_model: type[BaseModel]) -> dict:
     provider, base_url, configured_model = local_model_settings()
     if provider not in {"ollama", "lmstudio"}:
@@ -313,7 +328,10 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                     },
                 )
                 response.raise_for_status()
-                content = response.json()["message"]["content"]
+                try:
+                    content = response.json()["message"]["content"]
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise HTTPException(status_code=502, detail="Ollama returned an unexpected chat response shape.") from exc
             else:
                 model = configured_model
                 if not model:
@@ -346,20 +364,31 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                     },
                 )
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
+                try:
+                    choice = response.json()["choices"][0]
+                    message = choice["message"]
+                except (ValueError, KeyError, IndexError, TypeError) as exc:
+                    raise HTTPException(status_code=502, detail="LM Studio returned no usable chat completion choice.") from exc
+                if message.get("refusal"):
+                    raise HTTPException(status_code=502, detail="LM Studio refused the request; inspect its local server log.")
+                content = message.get("content")
+                if choice.get("finish_reason") == "length":
+                    raise HTTPException(status_code=502, detail="LM Studio stopped before completing the JSON response; increase its context or output limit.")
+            return decode_model_json(content, label)
     except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=503,
             detail=f"{label} is not reachable. Start its local server and load a model.",
         ) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail=f"{label} timed out while generating a response.") from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=503,
             detail=f"{label} returned HTTP {exc.response.status_code}. Check its server and model settings.",
         ) from exc
-    except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=502, detail="The local model returned an unreadable response.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read the response from {label}.") from exc
 
 
 @app.middleware("http")
