@@ -7,5 +7,6 @@ services:
       LM_STUDIO_BASE_URL: http://host.docker.internal:1234/v1
       LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-}
       LM_STUDIO_API_KEY: ${LM_STUDIO_API_KEY:-}
+      LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-600}
     ports:
       - "127.0.0.1:8000:8000"
