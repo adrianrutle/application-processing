@@ -114,7 +114,7 @@ class PdfProcessingTests(unittest.TestCase):
             decode_model_json("[]", "LM Studio")
         self.assertIn("not an object", error.exception.detail)
 
-    def test_lm_studio_uses_openai_compatible_json_api(self):
+    def test_lm_studio_uses_openai_compatible_text_mode(self):
         with (
             patch.object(app_module, "LLM_PROVIDER", "lmstudio"),
             patch.object(app_module, "LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
@@ -129,11 +129,7 @@ class PdfProcessingTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(FakeLMStudioClient.instance.request_url, "http://127.0.0.1:1234/v1/chat/completions")
         self.assertEqual(FakeLMStudioClient.instance.request_body["model"], "qwen-local")
-        self.assertEqual(FakeLMStudioClient.instance.request_body["response_format"]["type"], "json_schema")
-        self.assertEqual(
-            FakeLMStudioClient.instance.request_body["response_format"]["json_schema"]["name"],
-            "criteriaresponse",
-        )
+        self.assertEqual(FakeLMStudioClient.instance.request_body["response_format"], {"type": "text"})
         self.assertEqual(FakeLMStudioClient.instance.get_headers["Authorization"], "Bearer test-local-key")
 
     def test_lm_studio_status_reports_discovered_model_ready(self):
