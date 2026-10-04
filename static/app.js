@@ -72,7 +72,7 @@ async function checkModel() {
     }
     if (!status.connected) {
       elements.modelStatus.className = "model-status is-error";
-      elements.modelStatusText.textContent = status.provider === "lmstudio" ? "LM Studio server not reachable" : "Local Ollama not reachable";
+      elements.modelStatusText.textContent = status.error || (status.provider === "lmstudio" ? "LM Studio server not reachable" : "Local Ollama not reachable");
       return;
     }
     if (!status.model_available) {

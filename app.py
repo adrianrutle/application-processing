@@ -279,7 +279,12 @@ def lm_studio_model_ids(payload: dict) -> list[str]:
     return [item["id"] for item in payload.get("data", []) if isinstance(item.get("id"), str)]
 
 
-async def local_model_json(messages: list[dict]) -> dict:
+def lm_studio_headers() -> dict[str, str]:
+    api_key = os.getenv("LM_STUDIO_API_KEY")
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+async def local_model_json(messages: list[dict], response_model: type[BaseModel]) -> dict:
     provider, base_url, configured_model = local_model_settings()
     if provider not in {"ollama", "lmstudio"}:
         raise HTTPException(status_code=503, detail="Set LLM_PROVIDER to 'ollama' or 'lmstudio'.")
@@ -312,25 +317,32 @@ async def local_model_json(messages: list[dict]) -> dict:
             else:
                 model = configured_model
                 if not model:
-                    models_response = await client.get(f"{base_url}/models", timeout=5)
+                    models_response = await client.get(
+                        f"{base_url}/models",
+                        headers=lm_studio_headers(),
+                        timeout=5,
+                    )
                     models_response.raise_for_status()
                     model_ids = lm_studio_model_ids(models_response.json())
                     if not model_ids:
                         raise HTTPException(status_code=503, detail="Load a model in LM Studio first.")
                     model = model_ids[0]
-                headers = {}
-                api_key = os.getenv("LM_STUDIO_API_KEY")
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
                 response = await client.post(
                     f"{base_url}/chat/completions",
-                    headers=headers,
+                    headers=lm_studio_headers(),
                     json={
                         "model": model,
                         "messages": messages,
                         "stream": False,
                         "temperature": 0.1,
-                        "response_format": {"type": "json_object"},
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": response_model.__name__.lower(),
+                                "strict": False,
+                                "schema": response_model.model_json_schema(),
+                            },
+                        },
                     },
                 )
                 response.raise_for_status()
@@ -394,7 +406,7 @@ async def status():
                 )
                 model_available = bool(available_model) and not cloud_model_blocked
             else:
-                response = await client.get(f"{base_url}/models")
+                response = await client.get(f"{base_url}/models", headers=lm_studio_headers())
                 response.raise_for_status()
                 model_names = lm_studio_model_ids(response.json())
                 available_model = configured_model if configured_model in model_names else ""
@@ -406,6 +418,9 @@ async def status():
             model_available=model_available,
             model=available_model or configured_model,
         )
+        return status_data
+    except httpx.HTTPStatusError as exc:
+        status_data["error"] = f"LM Studio returned HTTP {exc.response.status_code}; check its API key and server settings."
         return status_data
     except (httpx.HTTPError, ValueError):
         return status_data
@@ -440,7 +455,8 @@ async def extract_criteria_for_text(announcement: str) -> CriteriaResponse:
                 ),
             },
             {"role": "user", "content": announcement[:MAX_ANNOUNCEMENT_CHARS]},
-        ]
+        ],
+        CriteriaResponse,
     )
     try:
         return CriteriaResponse.model_validate(result)
@@ -527,7 +543,8 @@ async def review_candidate(
                     f"{document_text}"
                 ),
             },
-        ]
+        ],
+        ReviewResponse,
     )
     try:
         review = ReviewResponse.model_validate(result)

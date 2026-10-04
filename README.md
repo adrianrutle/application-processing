@@ -31,7 +31,7 @@ In LM Studio, load your Qwen model and start its local server from the Developer
 LLM_PROVIDER=lmstudio LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1 uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-The app discovers the model ID from LM Studio. If more than one model is available, set `LM_STUDIO_MODEL` to the ID shown by `curl http://127.0.0.1:1234/v1/models`. The app uses LM Studio's OpenAI-compatible chat-completions API with JSON response mode and blocks non-loopback model URLs.
+The app discovers the model ID from LM Studio. If more than one model is available, set `LM_STUDIO_MODEL` to the ID shown by `curl http://127.0.0.1:1234/v1/models`. The app uses LM Studio's OpenAI-compatible chat-completions API with JSON Schema response mode and blocks non-loopback model URLs.
 
 ### Docker on macOS
 

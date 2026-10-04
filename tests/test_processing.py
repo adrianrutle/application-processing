@@ -9,6 +9,7 @@ from pypdf import PdfWriter
 
 from app import (
     app,
+    CriteriaResponse,
     extract_pdf_pages,
     extract_xml_sources,
     fetch_public_announcement,
@@ -40,6 +41,7 @@ class FakeLMStudioClient:
         self.instance = self
         self.request_url = ""
         self.request_body = {}
+        self.get_headers = {}
         FakeLMStudioClient.instance = self
 
     async def __aenter__(self):
@@ -49,6 +51,7 @@ class FakeLMStudioClient:
         return None
 
     async def get(self, url, **kwargs):
+        self.get_headers = kwargs.get("headers", {})
         return FakeResponse({"data": [{"id": "qwen-local"}]})
 
     async def post(self, url, headers=None, json=None):
@@ -103,20 +106,29 @@ class PdfProcessingTests(unittest.TestCase):
             patch.object(app_module, "LLM_PROVIDER", "lmstudio"),
             patch.object(app_module, "LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
             patch.object(app_module, "LM_STUDIO_MODEL", ""),
+            patch.dict("os.environ", {"LM_STUDIO_API_KEY": "test-local-key"}),
             patch.object(app_module.httpx, "AsyncClient", FakeLMStudioClient),
         ):
-            result = asyncio.run(local_model_json([{"role": "user", "content": "test"}]))
+            result = asyncio.run(
+                local_model_json([{"role": "user", "content": "test"}], CriteriaResponse)
+            )
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(FakeLMStudioClient.instance.request_url, "http://127.0.0.1:1234/v1/chat/completions")
         self.assertEqual(FakeLMStudioClient.instance.request_body["model"], "qwen-local")
-        self.assertEqual(FakeLMStudioClient.instance.request_body["response_format"], {"type": "json_object"})
+        self.assertEqual(FakeLMStudioClient.instance.request_body["response_format"]["type"], "json_schema")
+        self.assertEqual(
+            FakeLMStudioClient.instance.request_body["response_format"]["json_schema"]["name"],
+            "criteriaresponse",
+        )
+        self.assertEqual(FakeLMStudioClient.instance.get_headers["Authorization"], "Bearer test-local-key")
 
     def test_lm_studio_status_reports_discovered_model_ready(self):
         with (
             patch.object(app_module, "LLM_PROVIDER", "lmstudio"),
             patch.object(app_module, "LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
             patch.object(app_module, "LM_STUDIO_MODEL", ""),
+            patch.dict("os.environ", {"LM_STUDIO_API_KEY": "test-local-key"}),
             patch.object(app_module.httpx, "AsyncClient", FakeLMStudioClient),
         ):
             result = asyncio.run(app_module.status())
