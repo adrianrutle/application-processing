@@ -6,6 +6,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
+from types import SimpleNamespace
 
 from app import (
     app,
@@ -22,6 +23,7 @@ from app import (
     normalize_text,
 )
 import app as app_module
+from observability import trace_http_request
 
 
 class FakeResponse:
@@ -183,6 +185,21 @@ class PdfProcessingTests(unittest.TestCase):
         for url in ("http://example.org/job", "https://127.0.0.1/job"):
             with self.subTest(url=url), self.assertRaises(HTTPException):
                 asyncio.run(fetch_public_announcement(url))
+
+    def test_http_trace_logs_client_cancellation(self):
+        request = SimpleNamespace(
+            method="POST",
+            url=SimpleNamespace(path="/api/review"),
+        )
+
+        async def cancel_request(_request):
+            raise asyncio.CancelledError
+
+        with self.assertLogs("application_processing", level="INFO") as captured:
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(trace_http_request(request, cancel_request))
+
+        self.assertTrue(any("event=http.cancelled" in message for message in captured.output))
 
 
 if __name__ == "__main__":

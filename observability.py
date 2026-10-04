@@ -1,3 +1,4 @@
+import asyncio
 import contextvars
 import json
 import logging
@@ -29,6 +30,15 @@ async def trace_http_request(request, call_next):
     try:
         response = await call_next(request)
         return response
+    except asyncio.CancelledError:
+        if request.url.path.startswith("/api/"):
+            log_pipeline_event(
+                "http.cancelled",
+                method=request.method,
+                path=request.url.path,
+                duration_ms=round((time.perf_counter() - started) * 1000),
+            )
+        raise
     except Exception as exc:
         if request.url.path.startswith("/api/"):
             log_pipeline_event(

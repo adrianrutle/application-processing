@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import time
 from pathlib import Path
 from typing import Literal
 from html.parser import HTMLParser
@@ -31,6 +32,7 @@ MAX_DOCUMENT_CHARS = 160_000
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 MAX_ANNOUNCEMENT_BYTES = 10 * 1024 * 1024
 MAX_ANNOUNCEMENT_CHARS = 30_000
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "180"))
 RUNNING_IN_CODESPACES = os.getenv("CODESPACES", "").casefold() == "true"
 
 app = FastAPI(title="Application Review", docs_url=None, redoc_url=None)
@@ -348,16 +350,18 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
             detail="Ollama cloud models are blocked because candidate data must stay on this machine.",
         )
     label = "LM Studio" if provider == "lmstudio" else "Ollama"
+    request_started = time.perf_counter()
     log_pipeline_event(
         "model.request.start",
         provider=provider,
         model=configured_model or "auto-discover",
         response_type=response_model.__name__,
+        timeout_seconds=LLM_REQUEST_TIMEOUT_SECONDS,
         message_count=len(messages),
         prompt_chars=sum(len(message.get("content", "")) for message in messages),
     )
     try:
-        async with httpx.AsyncClient(timeout=180, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=LLM_REQUEST_TIMEOUT_SECONDS, trust_env=False) as client:
             if provider == "ollama":
                 response = await client.post(
                     f"{base_url}/api/chat",
@@ -444,8 +448,22 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
             status_code=503,
             detail=f"{label} is not reachable. Start its local server and load a model.",
         ) from exc
+    except asyncio.CancelledError:
+        log_pipeline_event(
+            "model.request.cancelled",
+            provider=provider,
+            elapsed_ms=round((time.perf_counter() - request_started) * 1000),
+        )
+        raise
     except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail=f"{label} timed out while generating a response.") from exc
+        elapsed_ms = round((time.perf_counter() - request_started) * 1000)
+        log_pipeline_event(
+            "model.request.timeout",
+            provider=provider,
+            timeout_seconds=LLM_REQUEST_TIMEOUT_SECONDS,
+            elapsed_ms=elapsed_ms,
+        )
+        raise HTTPException(status_code=504, detail=f"{label} timed out after {LLM_REQUEST_TIMEOUT_SECONDS:g} seconds.") from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=503,

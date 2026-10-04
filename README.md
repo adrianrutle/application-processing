@@ -58,6 +58,8 @@ Each XML upload is currently reviewed as one candidate document; the app does no
 
 The console emits request-correlated pipeline diagnostics: document type, page/path counts, text character counts, model/response type, token counts when supplied, JSON parsing/schema outcome, verified citation counts, request status, and duration. The UI shows the same request ID after completion or in an error, so its `request_id` log entries are easy to find. It deliberately does not log document text, prompts, or raw model output because those may contain applicant data. Each API response includes its request ID in the `X-Request-ID` header.
 
+Model calls have a 180-second timeout by default. Set `LLM_REQUEST_TIMEOUT_SECONDS` to change it. The console distinguishes `model.request.timeout` from `model.request.cancelled` and `http.cancelled` events, so a disconnect is not automatically mistaken for a timeout.
+
 ## Scope and safeguards
 
 - The model extracts explicit job-related criteria and compares application text with those criteria; it does not rank candidates or recommend hiring decisions.
