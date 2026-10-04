@@ -44,7 +44,11 @@ function showToast(message) {
 
 async function responseJson(response) {
   const body = await response.json();
-  if (!response.ok) throw new Error(body.detail || "The request could not be completed.");
+  const requestId = response.headers.get("X-Request-ID");
+  if (!response.ok) {
+    const detail = body.detail || "The request could not be completed.";
+    throw new Error(requestId ? `${detail} (request ${requestId})` : detail);
+  }
   return body;
 }
 
@@ -269,10 +273,12 @@ elements.extractCriteria.addEventListener("click", async () => {
   elements.extractCriteria.disabled = true;
   elements.criteriaStatus.textContent = "Extracting with local model…";
   try {
-    const result = await responseJson(await fetch(endpoint, requestOptions));
+    const response = await fetch(endpoint, requestOptions);
+    const requestId = response.headers.get("X-Request-ID");
+    const result = await responseJson(response);
     elements.criteriaList.replaceChildren();
     for (const criterion of result.criteria) addCriterion(criterion);
-    elements.criteriaStatus.textContent = `${result.criteria.length} criteria extracted; review and edit them.`;
+    elements.criteriaStatus.textContent = `${result.criteria.length} criteria extracted; review and edit them.${requestId ? ` Request ${requestId}.` : ""}`;
   } catch (error) {
     elements.criteriaStatus.textContent = "Extraction failed.";
     showToast(error.message);
@@ -323,7 +329,7 @@ elements.candidateDocument.addEventListener("change", async () => {
       elements.pageEnd.value = String(pdfPageCount);
       elements.pageRange.hidden = false;
     } else {
-      elements.fileDetails.textContent = `XML · ${info.source_count} text sections`;
+      elements.fileDetails.textContent = `XML · ${info.source_count} source paths · ${info.text_chars.toLocaleString()} characters`;
     }
   } catch (error) {
     selectedFile = null;
@@ -355,9 +361,11 @@ elements.reviewCandidate.addEventListener("click", async () => {
   elements.reviewCandidate.disabled = true;
   elements.reviewStatus.textContent = "Reviewing with local model…";
   try {
-    const result = await responseJson(await fetch("/api/review", { method: "POST", body: form }));
+    const response = await fetch("/api/review", { method: "POST", body: form });
+    const requestId = response.headers.get("X-Request-ID");
+    const result = await responseJson(response);
     renderResult(label, result);
-    elements.reviewStatus.textContent = "Review complete. Verify each note against the original application.";
+    elements.reviewStatus.textContent = `Review complete. Verify each note against the original application.${requestId ? ` Request ${requestId}.` : ""}`;
   } catch (error) {
     elements.reviewStatus.textContent = "Review failed.";
     showToast(error.message);

@@ -156,6 +156,7 @@ class PdfProcessingTests(unittest.TestCase):
             b"<Experience>Data analysis</Experience></Candidate>"
         )
         sources = extract_xml_sources(xml)
+        self.assertEqual(len(sources), 3)
         self.assertEqual(sources["/Candidate[1]/@id"], "C-1")
         self.assertEqual(sources["/Candidate[1]/Experience[1]"], "Python & XML")
         self.assertEqual(sources["/Candidate[1]/Experience[2]"], "Data analysis")
@@ -174,6 +175,9 @@ class PdfProcessingTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["document_type"], "xml")
+        self.assertEqual(response.json()["source_count"], 1)
+        self.assertEqual(response.json()["text_chars"], 6)
+        self.assertTrue(response.headers["x-request-id"])
 
     def test_announcement_url_rejects_http_and_loopback_hosts(self):
         for url in ("http://example.org/job", "https://127.0.0.1/job"):

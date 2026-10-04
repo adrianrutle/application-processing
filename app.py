@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
+from observability import log_pipeline_event, trace_http_request
 
 
 BASE_DIR = Path(__file__).parent
@@ -87,6 +88,12 @@ def extract_pdf_pages(file_obj, page_start: int = 1, page_end: int | None = None
             page_number: (reader.pages[page_number - 1].extract_text() or "")
             for page_number in range(page_start, end + 1)
         }
+        log_pipeline_event(
+            "pdf.parsed",
+            page_count=page_count,
+            selected_pages=len(pages),
+            text_chars=sum(len(text) for text in pages.values()),
+        )
         return page_count, pages
     except HTTPException:
         raise
@@ -128,7 +135,14 @@ def extract_xml_sources(file_obj) -> dict[str, str]:
 
     root_name = xml_local_name(root.tag)
     walk(root, f"/{root_name}[1]")
-    return {path: " ".join(parts) for path, parts in sources.items()}
+    result = {path: " ".join(parts) for path, parts in sources.items()}
+    log_pipeline_event(
+        "xml.parsed",
+        root_element=root_name,
+        source_paths=len(result),
+        text_chars=sum(len(text) for text in result.values()),
+    )
+    return result
 
 
 def detect_document_type(document: UploadFile) -> str:
@@ -220,6 +234,11 @@ async def fetch_public_announcement(url: str) -> str:
                         raise HTTPException(status_code=413, detail="The announcement URL content is too large.")
                     chunks.append(chunk)
                 content = b"".join(chunks)
+                log_pipeline_event(
+                    "announcement.url.fetched",
+                    content_type=content_type,
+                    bytes_received=len(content),
+                )
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
@@ -239,6 +258,7 @@ async def fetch_public_announcement(url: str) -> str:
     announcement = re.sub(r"\s+", " ", announcement).strip()
     if len(announcement) < 30:
         raise HTTPException(status_code=422, detail="No usable announcement text was found at this URL.")
+    log_pipeline_event("announcement.url.parsed", text_chars=min(len(announcement), MAX_ANNOUNCEMENT_CHARS))
     return announcement[:MAX_ANNOUNCEMENT_CHARS]
 
 
@@ -286,16 +306,30 @@ def lm_studio_headers() -> dict[str, str]:
 
 def decode_model_json(content, label: str) -> dict:
     if not isinstance(content, str) or not content.strip():
+        log_pipeline_event("model.response.empty", provider=label)
         raise HTTPException(status_code=502, detail=f"{label} returned empty or non-text response content.")
     try:
         result = json.loads(content)
     except json.JSONDecodeError as exc:
+        log_pipeline_event(
+            "model.response.invalid_json",
+            provider=label,
+            line=exc.lineno,
+            column=exc.colno,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"{label} returned invalid JSON (line {exc.lineno}, column {exc.colno}).",
         ) from exc
     if not isinstance(result, dict):
+        log_pipeline_event("model.response.wrong_json_type", provider=label, result_type=type(result).__name__)
         raise HTTPException(status_code=502, detail=f"{label} returned JSON that was not an object.")
+    log_pipeline_event(
+        "model.response.json_parsed",
+        provider=label,
+        top_level_keys=sorted(result.keys()),
+        list_sizes={key: len(value) for key, value in result.items() if isinstance(value, list)},
+    )
     return result
 
 
@@ -314,6 +348,14 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
             detail="Ollama cloud models are blocked because candidate data must stay on this machine.",
         )
     label = "LM Studio" if provider == "lmstudio" else "Ollama"
+    log_pipeline_event(
+        "model.request.start",
+        provider=provider,
+        model=configured_model or "auto-discover",
+        response_type=response_model.__name__,
+        message_count=len(messages),
+        prompt_chars=sum(len(message.get("content", "")) for message in messages),
+    )
     try:
         async with httpx.AsyncClient(timeout=180, trust_env=False) as client:
             if provider == "ollama":
@@ -329,9 +371,21 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                 )
                 response.raise_for_status()
                 try:
-                    content = response.json()["message"]["content"]
+                    upstream = response.json()
+                    message = upstream["message"]
+                    content = message["content"]
                 except (ValueError, KeyError, TypeError) as exc:
                     raise HTTPException(status_code=502, detail="Ollama returned an unexpected chat response shape.") from exc
+                log_pipeline_event(
+                    "model.response.received",
+                    provider=provider,
+                    model=configured_model,
+                    finish_reason=upstream.get("done_reason"),
+                    message_fields=sorted(message.keys()),
+                    content_chars=len(content) if isinstance(content, str) else 0,
+                    prompt_tokens=upstream.get("prompt_eval_count"),
+                    completion_tokens=upstream.get("eval_count"),
+                )
             else:
                 model = configured_model
                 if not model:
@@ -358,13 +412,30 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                 )
                 response.raise_for_status()
                 try:
-                    choice = response.json()["choices"][0]
+                    upstream = response.json()
+                    choice = upstream["choices"][0]
                     message = choice["message"]
                 except (ValueError, KeyError, IndexError, TypeError) as exc:
                     raise HTTPException(status_code=502, detail="LM Studio returned no usable chat completion choice.") from exc
                 if message.get("refusal"):
                     raise HTTPException(status_code=502, detail="LM Studio refused the request; inspect its local server log.")
                 content = message.get("content")
+                usage = upstream.get("usage", {})
+                log_pipeline_event(
+                    "model.response.received",
+                    provider=provider,
+                    model=model,
+                    finish_reason=choice.get("finish_reason"),
+                    message_fields=sorted(message.keys()),
+                    content_chars=len(content) if isinstance(content, str) else 0,
+                    reasoning_chars=(
+                        len(message.get("reasoning_content"))
+                        if isinstance(message.get("reasoning_content"), str)
+                        else 0
+                    ),
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                )
                 if choice.get("finish_reason") == "length":
                     raise HTTPException(status_code=502, detail="LM Studio stopped before completing the JSON response; increase its context or output limit.")
             return decode_model_json(content, label)
@@ -386,7 +457,7 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
 
 @app.middleware("http")
 async def no_store_headers(request, call_next):
-    response = await call_next(request)
+    response = await trace_http_request(request, call_next)
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -457,7 +528,11 @@ async def document_info(document: UploadFile = File(...)):
     sources = extract_xml_sources(document.file)
     if not sources:
         raise HTTPException(status_code=422, detail="No text content was found in this XML document.")
-    return {"document_type": "xml", "source_count": len(sources)}
+    return {
+        "document_type": "xml",
+        "source_count": len(sources),
+        "text_chars": sum(len(text) for text in sources.values()),
+    }
 
 
 async def extract_criteria_for_text(announcement: str) -> CriteriaResponse:
@@ -482,8 +557,11 @@ async def extract_criteria_for_text(announcement: str) -> CriteriaResponse:
         CriteriaResponse,
     )
     try:
-        return CriteriaResponse.model_validate(result)
+        criteria = CriteriaResponse.model_validate(result)
+        log_pipeline_event("criteria.validated", criteria_count=len(criteria.criteria))
+        return criteria
     except ValidationError as exc:
+        log_pipeline_event("criteria.validation_failed", error_count=len(exc.errors()))
         raise HTTPException(status_code=502, detail="The local model returned invalid criteria.") from exc
 
 
@@ -529,6 +607,13 @@ async def review_candidate(
         if not sources:
             raise HTTPException(status_code=422, detail="No text content was found in this XML document.")
     document_text = "\n".join(f"[Source: {reference}] {text}" for reference, text in sources.items()).strip()
+    log_pipeline_event(
+        "review.input.parsed",
+        document_type=document_type,
+        source_paths=len(sources),
+        text_chars=len(document_text),
+        criteria_count=len(criteria),
+    )
     if not document_text:
         raise HTTPException(
             status_code=422,
@@ -572,9 +657,11 @@ async def review_candidate(
     try:
         review = ReviewResponse.model_validate(result)
     except ValidationError as exc:
+        log_pipeline_event("review.validation_failed", error_count=len(exc.errors()))
         raise HTTPException(status_code=502, detail="The local model returned an invalid review.") from exc
 
     verified_reviews = []
+    model_evidence_count = sum(len(item.evidence) for item in review.criteria)
     for item in review.criteria:
         verified_evidence = [
             evidence
@@ -585,4 +672,10 @@ async def review_candidate(
         ]
         verified_reviews.append(item.model_copy(update={"evidence": verified_evidence}))
 
+    log_pipeline_event(
+        "review.validated",
+        criteria_returned=len(review.criteria),
+        evidence_returned=model_evidence_count,
+        evidence_verified=sum(len(item.evidence) for item in verified_reviews),
+    )
     return ReviewResponse(criteria=verified_reviews, summary=review.summary)

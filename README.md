@@ -54,6 +54,10 @@ If your LM Studio server requires an API key, export `LM_STUDIO_API_KEY` in the 
 
 The app handles text-based PDFs and XML up to 50 MB. Image-only scans need OCR before use. Large PDFs can be reviewed in smaller page ranges. Announcement URLs must use HTTPS, resolve to public IP addresses, and not redirect. Application documents are parsed for the request and are not added to a database; multipart uploads may be temporarily spooled by the web framework to the machine's system temporary directory. Review results stay in browser memory until the page is closed or cleared.
 
+Each XML upload is currently reviewed as one candidate document; the app does not split a multi-applicant XML export. The displayed XML source count is the number of distinct text-bearing element/attribute paths, not the number of candidates.
+
+The console emits request-correlated pipeline diagnostics: document type, page/path counts, text character counts, model/response type, token counts when supplied, JSON parsing/schema outcome, verified citation counts, request status, and duration. The UI shows the same request ID after completion or in an error, so its `request_id` log entries are easy to find. It deliberately does not log document text, prompts, or raw model output because those may contain applicant data. Each API response includes its request ID in the `X-Request-ID` header.
+
 ## Scope and safeguards
 
 - The model extracts explicit job-related criteria and compares application text with those criteria; it does not rank candidates or recommend hiring decisions.
