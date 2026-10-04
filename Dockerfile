@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY observability.py .
+COPY storage.py .
 COPY static ./static
 
 EXPOSE 8000

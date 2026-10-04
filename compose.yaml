@@ -8,5 +8,11 @@ services:
       LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-}
       LM_STUDIO_API_KEY: ${LM_STUDIO_API_KEY:-}
       LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-600}
+      APPLICATION_DB_PATH: /data/applications.sqlite3
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - application-review-data:/data
+
+volumes:
+  application-review-data:

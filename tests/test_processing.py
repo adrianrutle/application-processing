@@ -13,14 +13,17 @@ from app import (
     CriteriaResponse,
     decode_model_json,
     extract_pdf_pages,
+    extract_xml_candidate_sources,
     extract_xml_sources,
     fetch_public_announcement,
+    find_xml_candidate_groups,
     is_allowed_model_endpoint,
     is_loopback_endpoint,
     is_ollama_cloud_model,
     lm_studio_model_ids,
     local_model_json,
     normalize_text,
+    redact_candidate_sources,
 )
 import app as app_module
 from observability import trace_http_request
@@ -158,16 +161,63 @@ class PdfProcessingTests(unittest.TestCase):
             b"<Experience>Data analysis</Experience></Candidate>"
         )
         sources = extract_xml_sources(xml)
-        self.assertEqual(len(sources), 3)
-        self.assertEqual(sources["/Candidate[1]/@id"], "C-1")
+        self.assertEqual(len(sources), 2)
+        self.assertNotIn("/Candidate[1]/@id", sources)
         self.assertEqual(sources["/Candidate[1]/Experience[1]"], "Python & XML")
         self.assertEqual(sources["/Candidate[1]/Experience[2]"], "Data analysis")
+
+    def test_discovers_jobbnorge_candidate_records(self):
+        xml = io.BytesIO(
+            b"<Jobbnorge_Export><PositionOpening><PositionTitle>Role metadata</PositionTitle></PositionOpening>"
+            b"<Candidates><Candidate><ID>1</ID><FirstName>Ada</FirstName><GenderName>Female</GenderName>"
+            b"<ApplicationLetterText>Computational modelling experience.</ApplicationLetterText></Candidate>"
+            b"<Candidate><ID>2</ID><FirstName>Grace</FirstName><GenderName>Female</GenderName>"
+            b"<ApplicationLetterText>Thermal simulation research.</ApplicationLetterText></Candidate>"
+            b"</Candidates></Jobbnorge_Export>"
+        )
+        groups = find_xml_candidate_groups(xml)
+        self.assertEqual(groups, [{"path": "/Jobbnorge_Export/Candidates/Candidate", "count": 2}])
+
+    def test_extracts_one_xml_candidate_without_direct_identifiers(self):
+        xml = io.BytesIO(
+            b"<Jobbnorge_Export><Candidates><Candidate><ID>1</ID><FirstName>Ada</FirstName>"
+            b"<BirthDate>1990-01-01</BirthDate><GenderName>Female</GenderName>"
+            b"<ApplicationLetterText>Computational modelling experience.</ApplicationLetterText>"
+            b"</Candidate><Candidate><ID>2</ID><FirstName>Grace</FirstName>"
+            b"<ApplicationLetterText>Thermal simulation research.</ApplicationLetterText>"
+            b"</Candidate></Candidates></Jobbnorge_Export>"
+        )
+        sources = extract_xml_candidate_sources(
+            xml,
+            "/Jobbnorge_Export/Candidates/Candidate",
+            2,
+        )
+        joined_text = " ".join(sources.values())
+        self.assertIn("Thermal simulation research.", joined_text)
+        self.assertNotIn("Grace", joined_text)
+        self.assertNotIn("1990-01-01", joined_text)
+        self.assertNotIn("Female", joined_text)
 
     def test_rejects_xml_entity_declarations(self):
         xml = io.BytesIO(b'<!DOCTYPE x [<!ENTITY secret "hidden">]><Candidate>&secret;</Candidate>')
         with self.assertRaises(HTTPException) as error:
             extract_xml_sources(xml)
         self.assertEqual(error.exception.status_code, 422)
+
+    def test_redacts_private_xml_values_and_common_contact_data(self):
+        sources = {
+            "/Candidate[1]/ApplicationLetterText[1]":
+                "Ada Example wrote ada@example.test and called +47 123 45 678."
+        }
+        redacted = redact_candidate_sources(
+            sources,
+            {"FirstName": "Ada", "SurName": "Example", "Email": "ada@example.test"},
+        )
+        text = next(iter(redacted.values()))
+        self.assertNotIn("Ada", text)
+        self.assertNotIn("Example", text)
+        self.assertNotIn("ada@example.test", text)
+        self.assertNotIn("+47 123 45 678", text)
 
     def test_document_info_accepts_xml_upload(self):
         client = TestClient(app)

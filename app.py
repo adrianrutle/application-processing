@@ -1,3 +1,4 @@
+import csv
 import asyncio
 import io
 import ipaddress
@@ -6,6 +7,7 @@ import os
 import re
 import socket
 import time
+import uuid
 from pathlib import Path
 from typing import Literal
 from html.parser import HTMLParser
@@ -15,11 +17,12 @@ import httpx
 from defusedxml import ElementTree as SafeElementTree
 from defusedxml.common import DefusedXmlException
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
-from observability import log_pipeline_event, trace_http_request
+from observability import log_pipeline_event, request_id_context, trace_http_request
+import storage
 
 
 BASE_DIR = Path(__file__).parent
@@ -34,6 +37,36 @@ MAX_ANNOUNCEMENT_BYTES = 10 * 1024 * 1024
 MAX_ANNOUNCEMENT_CHARS = 30_000
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "600"))
 RUNNING_IN_CODESPACES = os.getenv("CODESPACES", "").casefold() == "true"
+XML_CANDIDATE_TAGS = {"candidate", "applicant"}
+XML_EXCLUDED_TAGS = {
+    "id",
+    "candidateid",
+    "firstname",
+    "surname",
+    "lastname",
+    "middlename",
+    "street",
+    "postalcode",
+    "city",
+    "municipality",
+    "privatephone",
+    "jobphone",
+    "mobile",
+    "email",
+    "birthdate",
+    "citizenshipcode",
+    "citizenshipname",
+    "residencecode",
+    "residencename",
+    "genderid",
+    "gendername",
+    "isimmigrant",
+    "immigrantdescription",
+    "hasdisability",
+    "disabilitydescription",
+    "isexcemptedfrompublicaccess",
+    "hasredundancycertificate",
+}
 
 app = FastAPI(title="Application Review", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -50,7 +83,16 @@ class Criterion(BaseModel):
 
 
 class CriteriaResponse(BaseModel):
-    criteria: list[Criterion]
+    criteria: list[Criterion] = Field(min_length=1, max_length=100)
+
+
+class JobCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    criteria: list[Criterion] = Field(min_length=1, max_length=100)
+
+
+class CriteriaSetRequest(BaseModel):
+    criteria: list[Criterion] = Field(min_length=1, max_length=100)
 
 
 class Evidence(BaseModel):
@@ -74,49 +116,112 @@ class AnnouncementUrlRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
 
 
+class PdfCandidateRange(BaseModel):
+    label: str = Field(min_length=1, max_length=100)
+    local_reference: str = Field(default="", max_length=150)
+    page_start: int = Field(ge=1)
+    page_end: int = Field(ge=1)
+
+
+MAX_BATCH_CANDIDATES = 100
+batch_tasks: set[asyncio.Task] = set()
+
+
 def extract_pdf_pages(file_obj, page_start: int = 1, page_end: int | None = None):
     try:
         reader = PdfReader(file_obj, strict=False)
-        page_count = len(reader.pages)
-        if page_count == 0:
-            raise HTTPException(status_code=422, detail="The PDF contains no pages.")
-        end = page_count if page_end is None else page_end
-        if page_start < 1 or end < page_start or end > page_count:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Choose a page range from 1 to {page_count}.",
-            )
-        pages = {
-            page_number: (reader.pages[page_number - 1].extract_text() or "")
-            for page_number in range(page_start, end + 1)
-        }
-        log_pipeline_event(
-            "pdf.parsed",
-            page_count=page_count,
-            selected_pages=len(pages),
-            text_chars=sum(len(text) for text in pages.values()),
-        )
-        return page_count, pages
+        return extract_pdf_reader_pages(reader, page_start, page_end)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail="Could not read this PDF.") from exc
 
 
+def extract_pdf_reader_pages(reader, page_start: int = 1, page_end: int | None = None):
+    page_count = len(reader.pages)
+    if page_count == 0:
+        raise HTTPException(status_code=422, detail="The PDF contains no pages.")
+    end = page_count if page_end is None else page_end
+    if page_start < 1 or end < page_start or end > page_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Choose a page range from 1 to {page_count}.",
+        )
+    pages = {
+        page_number: (reader.pages[page_number - 1].extract_text() or "")
+        for page_number in range(page_start, end + 1)
+    }
+    log_pipeline_event(
+        "pdf.parsed",
+        page_count=page_count,
+        selected_pages=len(pages),
+        text_chars=sum(len(text) for text in pages.values()),
+    )
+    return page_count, pages
+
+
 def xml_local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def extract_xml_sources(file_obj) -> dict[str, str]:
+def parse_xml_root(file_obj):
     try:
-        root = SafeElementTree.parse(file_obj).getroot()
+        return SafeElementTree.parse(file_obj).getroot()
     except (DefusedXmlException, SafeElementTree.ParseError, OSError) as exc:
         raise HTTPException(status_code=422, detail="Could not read this XML document safely.") from exc
 
+
+def find_xml_candidate_groups(file_obj) -> list[dict]:
+    root = parse_xml_root(file_obj)
+    groups = []
+    if xml_local_name(root.tag).casefold() in XML_CANDIDATE_TAGS:
+        groups.append({"path": f"/{xml_local_name(root.tag)}", "count": 1})
+
+    def walk(element, path: str):
+        sibling_counts: dict[str, int] = {}
+        for child in element:
+            if not isinstance(child.tag, str):
+                continue
+            name = xml_local_name(child.tag)
+            sibling_counts[name] = sibling_counts.get(name, 0) + 1
+            child_path = f"{path}/{name}"
+            if name.casefold() in XML_CANDIDATE_TAGS:
+                groups.append({"path": child_path, "count": 1})
+            walk(child, child_path)
+
+    walk(root, f"/{xml_local_name(root.tag)}")
+    grouped: dict[str, dict] = {}
+    for group in groups:
+        existing = grouped.get(group["path"])
+        if existing is None:
+            grouped[group["path"]] = group
+        else:
+            existing["count"] += group["count"]
+    return list(grouped.values())
+
+
+def find_xml_records(root, record_path: str) -> list:
+    path_parts = [part for part in record_path.split("/") if part]
+    if not path_parts or xml_local_name(root.tag) != path_parts[0]:
+        return []
+    current = [root]
+    for path_part in path_parts[1:]:
+        current = [
+            child
+            for element in current
+            for child in element
+            if isinstance(child.tag, str) and xml_local_name(child.tag) == path_part
+        ]
+    return current
+
+
+def extract_xml_element_sources(element, root_path: str) -> dict[str, str]:
     sources: dict[str, list[str]] = {}
 
     def walk(element, path: str):
         for attribute_name, attribute_value in element.attrib.items():
+            if xml_local_name(attribute_name).casefold() in XML_EXCLUDED_TAGS:
+                continue
             attribute_path = f"{path}/@{xml_local_name(attribute_name)}"
             sources.setdefault(attribute_path, []).append(attribute_value)
         text = (element.text or "").strip()
@@ -128,6 +233,9 @@ def extract_xml_sources(file_obj) -> dict[str, str]:
             if not isinstance(child.tag, str):
                 continue
             child_name = xml_local_name(child.tag)
+            # Keep direct identifiers and demographic elements in the local profile only.
+            if child_name.casefold() in XML_EXCLUDED_TAGS:
+                continue
             sibling_counts[child_name] = sibling_counts.get(child_name, 0) + 1
             child_path = f"{path}/{child_name}[{sibling_counts[child_name]}]"
             walk(child, child_path)
@@ -135,9 +243,14 @@ def extract_xml_sources(file_obj) -> dict[str, str]:
             if tail:
                 sources.setdefault(path, []).append(tail)
 
+    walk(element, root_path)
+    return {path: " ".join(parts) for path, parts in sources.items()}
+
+
+def extract_xml_sources(file_obj) -> dict[str, str]:
+    root = parse_xml_root(file_obj)
     root_name = xml_local_name(root.tag)
-    walk(root, f"/{root_name}[1]")
-    result = {path: " ".join(parts) for path, parts in sources.items()}
+    result = extract_xml_element_sources(root, f"/{root_name}[1]")
     log_pipeline_event(
         "xml.parsed",
         root_element=root_name,
@@ -145,6 +258,107 @@ def extract_xml_sources(file_obj) -> dict[str, str]:
         text_chars=sum(len(text) for text in result.values()),
     )
     return result
+
+
+def extract_xml_candidate_sources(file_obj, record_path: str, record_index: int) -> dict[str, str]:
+    root = parse_xml_root(file_obj)
+    records = find_xml_records(root, record_path)
+    if record_index < 1 or record_index > len(records):
+        raise HTTPException(status_code=422, detail="XML candidate index is out of range.")
+    sources = extract_xml_element_sources(records[record_index - 1], f"{record_path}[{record_index}]")
+    log_pipeline_event(
+        "xml.candidate.parsed",
+        record_path=record_path,
+        record_index=record_index,
+        source_paths=len(sources),
+        text_chars=sum(len(text) for text in sources.values()),
+        excluded_fields=len(XML_EXCLUDED_TAGS),
+    )
+    return sources
+
+
+def extract_xml_candidate_demographics(file_obj, record_path: str, record_index: int) -> tuple[str, dict[str, str]]:
+    root = parse_xml_root(file_obj)
+    records = find_xml_records(root, record_path)
+    if record_index < 1 or record_index > len(records):
+        raise HTTPException(status_code=422, detail="XML candidate index is out of range.")
+
+    private_fields = {}
+    source_record_id = ""
+    for child in records[record_index - 1]:
+        if not isinstance(child.tag, str):
+            continue
+        field_name = xml_local_name(child.tag)
+        normalized_name = field_name.casefold()
+        if normalized_name not in XML_EXCLUDED_TAGS:
+            continue
+        value = " ".join("".join(child.itertext()).split())
+        if not value:
+            continue
+        if normalized_name == "id":
+            source_record_id = value
+        else:
+            private_fields[field_name] = value
+    return source_record_id, private_fields
+
+
+def extract_xml_candidate_demographics_from_root(root, record_path: str, record_index: int) -> tuple[str, dict[str, str]]:
+    records = find_xml_records(root, record_path)
+    if record_index < 1 or record_index > len(records):
+        raise HTTPException(status_code=422, detail="XML candidate index is out of range.")
+
+    private_fields = {}
+    source_record_id = ""
+    for child in records[record_index - 1]:
+        if not isinstance(child.tag, str):
+            continue
+        field_name = xml_local_name(child.tag)
+        normalized_name = field_name.casefold()
+        if normalized_name not in XML_EXCLUDED_TAGS:
+            continue
+        value = " ".join("".join(child.itertext()).split())
+        if not value:
+            continue
+        if normalized_name == "id":
+            source_record_id = value
+            private_fields[field_name] = value
+        else:
+            private_fields[field_name] = value
+    return source_record_id, private_fields
+
+
+def redact_candidate_sources(sources: dict[str, str], private_fields: dict[str, str] | None = None) -> dict[str, str]:
+    private_values = []
+    for field_name, value in (private_fields or {}).items():
+        if field_name.casefold().startswith(("is", "has")):
+            continue
+        normalized = " ".join(str(value).split())
+        if len(normalized) >= 2:
+            private_values.append(normalized)
+    private_values.sort(key=len, reverse=True)
+
+    email_pattern = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+    phone_pattern = re.compile(r"(?<!\w)\+?\d[\d ().-]{6,}\d(?!\w)")
+    # PDF redaction is best-effort; structured XML demographics are removed by field name first.
+    private_label_pattern = re.compile(
+        r"^\s*(?:full\s+name|first\s+name|last\s+name|name|e-?mail|phone|mobile|date\s+of\s+birth|birthdate|dob|gender|nationality|citizenship|address|street|postal\s+code|fødselsdato|kjønn|nasjonalitet|statsborgerskap|adresse|telefon)\s*[:\-]",
+        re.IGNORECASE,
+    )
+
+    redacted = {}
+    for reference, original_text in sources.items():
+        text = original_text
+        for value in private_values:
+            pattern = rf"(?<!\w){re.escape(value)}(?!\w)"
+            text = re.sub(pattern, "[REDACTED]", text, flags=re.IGNORECASE)
+        text = email_pattern.sub("[REDACTED]", text)
+        text = phone_pattern.sub("[REDACTED]", text)
+        text = "\n".join(
+            "[REDACTED PERSONAL FIELD]" if private_label_pattern.match(line) else line
+            for line in text.splitlines()
+        )
+        redacted[reference] = text
+    return redacted
 
 
 def detect_document_type(document: UploadFile) -> str:
@@ -443,11 +657,6 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                 if choice.get("finish_reason") == "length":
                     raise HTTPException(status_code=502, detail="LM Studio stopped before completing the JSON response; increase its context or output limit.")
             return decode_model_json(content, label)
-    except httpx.ConnectError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"{label} is not reachable. Start its local server and load a model.",
-        ) from exc
     except asyncio.CancelledError:
         log_pipeline_event(
             "model.request.cancelled",
@@ -537,6 +746,88 @@ async def status():
         return status_data
 
 
+def csv_response(rows: list[dict], filename: str) -> Response:
+    if not rows:
+        return Response(content="", media_type="text/csv; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        })
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+    writer.writeheader()
+    for row in rows:
+        safe_row = {}
+        for key, value in row.items():
+            text = "" if value is None else str(value)
+            safe_row[key] = f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
+        writer.writerow(safe_row)
+    return Response(
+        content="\ufeff" + output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/jobs")
+async def list_saved_jobs():
+    return {"jobs": storage.list_jobs()}
+
+
+@app.post("/api/jobs")
+async def create_saved_job(request: JobCreateRequest):
+    job = storage.create_job(
+        request.title,
+        [criterion.model_dump() for criterion in request.criteria],
+    )
+    log_pipeline_event("job.created", criteria_count=len(request.criteria))
+    return job
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_saved_job(job_id: str):
+    job = storage.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Saved job not found.")
+    return job
+
+
+@app.post("/api/jobs/{job_id}/criteria")
+async def save_job_criteria(job_id: str, request: CriteriaSetRequest):
+    try:
+        criteria_set = storage.save_criteria_set(
+            job_id,
+            [criterion.model_dump() for criterion in request.criteria],
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Saved job not found.") from exc
+    log_pipeline_event(
+        "job.criteria.saved",
+        criteria_count=len(request.criteria),
+        version=criteria_set["version"],
+    )
+    return criteria_set
+
+
+@app.get("/api/jobs/{job_id}/reviews")
+async def get_saved_job_reviews(job_id: str):
+    if storage.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Saved job not found.")
+    return {"reviews": storage.list_job_reviews(job_id)}
+
+
+@app.get("/api/jobs/{job_id}/export.csv")
+async def export_job_reviews(job_id: str):
+    if storage.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Saved job not found.")
+    return csv_response(storage.export_rows(job_id), f"job-{job_id}-reviews.csv")
+
+
+@app.get("/api/jobs/{job_id}/demographics.csv")
+async def export_job_demographics(job_id: str):
+    if storage.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Saved job not found.")
+    return csv_response(storage.list_job_demographics(job_id), f"job-{job_id}-demographics.csv")
+
+
 @app.post("/api/document-info")
 async def document_info(document: UploadFile = File(...)):
     document_type = detect_document_type(document)
@@ -546,10 +837,12 @@ async def document_info(document: UploadFile = File(...)):
     sources = extract_xml_sources(document.file)
     if not sources:
         raise HTTPException(status_code=422, detail="No text content was found in this XML document.")
+    document.file.seek(0)
     return {
         "document_type": "xml",
         "source_count": len(sources),
         "text_chars": sum(len(text) for text in sources.values()),
+        "candidate_groups": find_xml_candidate_groups(document.file),
     }
 
 
@@ -602,28 +895,11 @@ async def extract_criteria_from_url(request: AnnouncementUrlRequest):
     return await extract_criteria_for_text(announcement)
 
 
-@app.post("/api/review", response_model=ReviewResponse)
-async def review_candidate(
-    document: UploadFile = File(...),
-    criteria_json: str = Form(...),
-    page_start: int = Form(1, ge=1),
-    page_end: int | None = Form(None, ge=1),
-):
-    document_type = detect_document_type(document)
-    try:
-        criteria = CriteriaResponse.model_validate_json(criteria_json).criteria
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail="Review criteria are invalid.") from exc
-    if not criteria:
-        raise HTTPException(status_code=422, detail="Add at least one criterion before reviewing.")
-
-    if document_type == "pdf":
-        _, page_text = extract_pdf_pages(document.file, page_start, page_end)
-        sources = {f"Page {page}": text for page, text in page_text.items()}
-    else:
-        sources = extract_xml_sources(document.file)
-        if not sources:
-            raise HTTPException(status_code=422, detail="No text content was found in this XML document.")
+async def evaluate_candidate_sources(
+    sources: dict[str, str],
+    document_type: str,
+    criteria: list[Criterion],
+) -> ReviewResponse:
     document_text = "\n".join(f"[Source: {reference}] {text}" for reference, text in sources.items()).strip()
     log_pipeline_event(
         "review.input.parsed",
@@ -635,12 +911,12 @@ async def review_candidate(
     if not document_text:
         raise HTTPException(
             status_code=422,
-            detail="No selectable text was found. Scanned PDFs need OCR before review.",
+            detail="No reviewable text was found in this candidate's document segment.",
         )
     if len(document_text) > MAX_DOCUMENT_CHARS:
         raise HTTPException(
             status_code=413,
-            detail="This page range is too large for one review. Split it into smaller ranges.",
+            detail="This candidate segment is too large for one review. Reduce the page range or XML record size.",
         )
 
     criteria_text = json.dumps([item.model_dump() for item in criteria], ensure_ascii=True)
@@ -697,3 +973,224 @@ async def review_candidate(
         evidence_verified=sum(len(item.evidence) for item in verified_reviews),
     )
     return ReviewResponse(criteria=verified_reviews, summary=review.summary)
+
+
+@app.post("/api/review", response_model=ReviewResponse)
+async def review_candidate(
+    document: UploadFile = File(...),
+    criteria_json: str = Form(...),
+    page_start: int = Form(1, ge=1),
+    page_end: int | None = Form(None, ge=1),
+):
+    document_type = detect_document_type(document)
+    try:
+        criteria = CriteriaResponse.model_validate_json(criteria_json).criteria
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Review criteria are invalid.") from exc
+    if not criteria:
+        raise HTTPException(status_code=422, detail="Add at least one criterion before reviewing.")
+
+    if document_type == "pdf":
+        _, page_text = extract_pdf_pages(document.file, page_start, page_end)
+        sources = redact_candidate_sources({f"Page {page}": text for page, text in page_text.items()})
+    else:
+        document_bytes = await document.read()
+        xml_root = parse_xml_root(io.BytesIO(document_bytes))
+        candidate_groups = find_xml_candidate_groups(io.BytesIO(document_bytes))
+        candidate_count = sum(group["count"] for group in candidate_groups)
+        if candidate_count > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="This XML contains multiple candidates. Use Start review batch and select candidate records.",
+            )
+        if candidate_groups:
+            record_path = candidate_groups[0]["path"]
+            source_record_id, demographics = extract_xml_candidate_demographics_from_root(xml_root, record_path, 1)
+            sources = extract_xml_candidate_sources(io.BytesIO(document_bytes), record_path, 1)
+            sources = redact_candidate_sources(sources, demographics)
+        else:
+            sources = redact_candidate_sources(
+                extract_xml_element_sources(xml_root, f"/{xml_local_name(xml_root.tag)}[1]")
+            )
+        if not sources:
+            raise HTTPException(status_code=422, detail="No text content was found in this XML document.")
+    return await evaluate_candidate_sources(sources, document_type, criteria)
+
+
+async def process_review_batch(batch_id: str, document_bytes: bytes, document_type: str):
+    request_token = request_id_context.set(batch_id[:12])
+    log_pipeline_event("batch.processing.started", batch_id=batch_id, document_type=document_type)
+    try:
+        storage.set_batch_status(batch_id, "processing")
+        # Uploaded bytes live only for this worker's lifetime; storage receives chunk locations and results, never the file.
+        work_items = storage.get_batch_work_items(batch_id)
+        batch = storage.get_batch(batch_id)
+        criteria_set = storage.get_criteria_set(batch["job_id"], batch["criteria_set_id"])
+        criteria = [Criterion.model_validate(item) for item in criteria_set["criteria"]]
+        pdf_reader = PdfReader(io.BytesIO(document_bytes), strict=False) if document_type == "pdf" else None
+        xml_root = parse_xml_root(io.BytesIO(document_bytes)) if document_type == "xml" else None
+
+        for item in work_items:
+            storage.set_batch_item_status(item["id"], "processing")
+            try:
+                if document_type == "pdf":
+                    page_start = item["chunk_spec"]["page_start"]
+                    page_end = item["chunk_spec"]["page_end"]
+                    _, page_text = extract_pdf_reader_pages(pdf_reader, page_start, page_end)
+                    sources = redact_candidate_sources({f"Page {page}": text for page, text in page_text.items()})
+                else:
+                    record_path = item["chunk_spec"]["record_path"]
+                    record_index = item["chunk_spec"]["record_index"]
+                    records = find_xml_records(xml_root, record_path)
+                    if record_index < 1 or record_index > len(records):
+                        raise HTTPException(status_code=422, detail="XML candidate index is out of range.")
+                    sources = extract_xml_element_sources(
+                        records[record_index - 1],
+                        f"{record_path}[{record_index}]",
+                    )
+                    sources = redact_candidate_sources(sources, item["demographics"])
+                review = await evaluate_candidate_sources(sources, document_type, criteria)
+                provider, _, configured_model = local_model_settings()
+                storage.save_review(
+                    item["id"],
+                    provider,
+                    configured_model or "auto-discovered",
+                    review.model_dump(),
+                )
+                log_pipeline_event(
+                    "batch.candidate.complete",
+                    batch_id=batch_id,
+                    candidate_ordinal=item["ordinal"] + 1,
+                )
+            except HTTPException as exc:
+                storage.set_batch_item_status(item["id"], "failed", exc.detail)
+                log_pipeline_event(
+                    "batch.candidate.failed",
+                    batch_id=batch_id,
+                    candidate_ordinal=item["ordinal"] + 1,
+                    status=exc.status_code,
+                )
+            except Exception as exc:
+                storage.set_batch_item_status(
+                    item["id"],
+                    "failed",
+                    "Unexpected processing error; inspect the server log.",
+                )
+                log_pipeline_event(
+                    "batch.candidate.error",
+                    batch_id=batch_id,
+                    candidate_ordinal=item["ordinal"] + 1,
+                    error_type=type(exc).__name__,
+                )
+        log_pipeline_event("batch.processing.finished", batch_id=batch_id)
+    except Exception as exc:
+        log_pipeline_event("batch.processing.error", batch_id=batch_id, error_type=type(exc).__name__)
+        for item in storage.get_batch_work_items(batch_id):
+            if item["status"] in {"queued", "processing"}:
+                storage.set_batch_item_status(item["id"], "failed", "Batch could not be processed.")
+    finally:
+        request_id_context.reset(request_token)
+
+
+@app.post("/api/review-batches", status_code=202)
+async def start_review_batch(
+    document: UploadFile = File(...),
+    job_id: str = Form(...),
+    criteria_set_id: str = Form(...),
+    pdf_ranges_json: str = Form(""),
+    xml_record_path: str = Form(""),
+    xml_start: int = Form(1, ge=1),
+    xml_end: int | None = Form(None, ge=1),
+):
+    document_type = detect_document_type(document)
+    criteria_set = storage.get_criteria_set(job_id, criteria_set_id)
+    if criteria_set is None:
+        raise HTTPException(status_code=404, detail="Saved job or criteria version not found.")
+    document_bytes = await document.read()
+    if len(document_bytes) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(status_code=413, detail="Documents must be 50 MB or smaller.")
+
+    candidates = []
+    if document_type == "pdf":
+        try:
+            page_count = len(PdfReader(io.BytesIO(document_bytes), strict=False).pages)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Could not read this PDF.") from exc
+        try:
+            range_values = json.loads(pdf_ranges_json)
+            ranges = [PdfCandidateRange.model_validate(item) for item in range_values]
+        except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail="Enter PDF candidate ranges as a JSON list.") from exc
+        if not ranges:
+            raise HTTPException(status_code=422, detail="Add at least one PDF candidate page range.")
+        if len(ranges) > MAX_BATCH_CANDIDATES:
+            raise HTTPException(status_code=422, detail=f"A batch can contain at most {MAX_BATCH_CANDIDATES} candidates.")
+        used_pages = set()
+        for ordinal, candidate in enumerate(ranges):
+            if candidate.page_end > page_count:
+                raise HTTPException(status_code=422, detail=f"Candidate {ordinal + 1} ends beyond the PDF's {page_count} pages.")
+            pages = set(range(candidate.page_start, candidate.page_end + 1))
+            if used_pages.intersection(pages):
+                raise HTTPException(status_code=422, detail="PDF candidate page ranges must not overlap.")
+            used_pages.update(pages)
+            candidates.append(
+                {
+                    "local_reference": candidate.local_reference.strip() or f"{job_id}:pdf:{uuid.uuid4().hex}",
+                    "display_label": candidate.label.strip(),
+                    "source_type": "pdf",
+                    "source_reference": f"Pages {candidate.page_start}-{candidate.page_end}",
+                    "chunk_spec": {"page_start": candidate.page_start, "page_end": candidate.page_end},
+                }
+            )
+    else:
+        xml_root = parse_xml_root(io.BytesIO(document_bytes))
+        record_groups = find_xml_candidate_groups(io.BytesIO(document_bytes))
+        selected_group = next((group for group in record_groups if group["path"] == xml_record_path), None)
+        if selected_group is None:
+            raise HTTPException(status_code=422, detail="Select a detected XML candidate record element.")
+        records = find_xml_records(xml_root, xml_record_path)
+        end = len(records) if xml_end is None else xml_end
+        if xml_start > end or end > len(records):
+            raise HTTPException(status_code=422, detail=f"Choose candidate records from 1 to {len(records)}.")
+        if end - xml_start + 1 > MAX_BATCH_CANDIDATES:
+            raise HTTPException(status_code=422, detail=f"A batch can contain at most {MAX_BATCH_CANDIDATES} candidates.")
+        for record_index in range(xml_start, end + 1):
+            source_record_id, demographics = extract_xml_candidate_demographics_from_root(
+                xml_root,
+                xml_record_path,
+                record_index,
+            )
+            local_reference = f"jobbnorge:{source_record_id}" if source_record_id else f"{job_id}:xml:{uuid.uuid4().hex}"
+            candidates.append(
+                {
+                    "local_reference": local_reference,
+                    "display_label": f"Candidate {record_index:03d}",
+                    "source_type": "xml",
+                    "source_reference": f"{xml_record_path}[{record_index}]",
+                    "chunk_spec": {"record_path": xml_record_path, "record_index": record_index},
+                    "demographics": demographics,
+                }
+            )
+
+    try:
+        batch_id = storage.create_batch(job_id, criteria_set_id, candidates)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Saved job or criteria version not found.") from exc
+    task = asyncio.create_task(process_review_batch(batch_id, document_bytes, document_type))
+    batch_tasks.add(task)
+    task.add_done_callback(batch_tasks.discard)
+    log_pipeline_event(
+        "batch.queued",
+        batch_id=batch_id,
+        document_type=document_type,
+        candidate_count=len(candidates),
+    )
+    return {"batch_id": batch_id, "status": "queued", "candidate_count": len(candidates)}
+
+
+@app.get("/api/review-batches/{batch_id}")
+async def get_review_batch(batch_id: str):
+    batch = storage.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Review batch not found.")
+    return batch

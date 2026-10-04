@@ -27,12 +27,32 @@ const elements = {
   resultsList: document.querySelector("#results-list"),
   clearReviews: document.querySelector("#clear-reviews"),
   toast: document.querySelector("#toast"),
+  jobTitle: document.querySelector("#job-title"),
+  saveJob: document.querySelector("#save-job"),
+  newJob: document.querySelector("#new-job"),
+  savedJobs: document.querySelector("#saved-jobs"),
+  loadJob: document.querySelector("#load-job"),
+  jobStatus: document.querySelector("#job-status"),
+  pdfBatchConfig: document.querySelector("#pdf-batch-config"),
+  pdfCandidateRanges: document.querySelector("#pdf-candidate-ranges"),
+  xmlBatchConfig: document.querySelector("#xml-batch-config"),
+  xmlCandidateGroup: document.querySelector("#xml-candidate-group"),
+  xmlRecordStart: document.querySelector("#xml-record-start"),
+  xmlRecordEnd: document.querySelector("#xml-record-end"),
+  batchProgress: document.querySelector("#batch-progress"),
+  exportReviews: document.querySelector("#export-reviews"),
+  exportDemographics: document.querySelector("#export-demographics"),
 };
 
 let modelReady = false;
 let selectedFile = null;
 let selectedDocumentType = null;
 let pdfPageCount = 0;
+let xmlCandidateGroups = [];
+let currentJobId = "";
+let currentCriteriaSetId = "";
+let criteriaDirty = false;
+let batchInProgress = false;
 let toastTimer;
 
 function showToast(message) {
@@ -110,10 +130,124 @@ function criteriaValues() {
 }
 
 function updateReviewButton() {
-  elements.reviewCandidate.disabled = !modelReady || !selectedDocumentType || criteriaValues().length === 0;
+  const hasCandidateUnits = selectedDocumentType === "pdf"
+    ? pdfPageCount > 0
+    : selectedDocumentType === "xml" && xmlCandidateGroups.length > 0;
+  elements.reviewCandidate.disabled = !modelReady
+    || !selectedFile
+    || !hasCandidateUnits
+    || !currentJobId
+    || !currentCriteriaSetId
+    || criteriaDirty
+    || batchInProgress;
+  updateSaveButton();
+  elements.exportReviews.disabled = !currentJobId;
+  elements.exportDemographics.disabled = !currentJobId;
+  elements.reviewCandidate.textContent = selectedDocumentType === "xml" && xmlCandidateGroups.length
+    ? "Review selected candidates"
+    : "Start review batch";
 }
 
-function addCriterion(criterion = { name: "", description: "", category: "required" }) {
+function updateSaveButton() {
+  elements.saveJob.disabled = !elements.jobTitle.value.trim() || !criteriaValues().length || batchInProgress;
+}
+
+async function refreshSavedJobs(selectedId = "") {
+  const result = await responseJson(await fetch("/api/jobs", { cache: "no-store" }));
+  elements.savedJobs.replaceChildren(new Option("Choose a saved role", ""));
+  for (const job of result.jobs) {
+    const option = new Option(`${job.title} · v${job.version} · ${job.criteria_count} criteria`, job.id);
+    elements.savedJobs.append(option);
+  }
+  elements.savedJobs.value = selectedId;
+  elements.loadJob.disabled = !elements.savedJobs.value;
+}
+
+async function loadSavedJob(jobId) {
+  if (!jobId) return;
+  try {
+    const job = await responseJson(await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" }));
+    currentJobId = job.id;
+    currentCriteriaSetId = job.criteria_set_id;
+    criteriaDirty = false;
+    elements.jobTitle.value = job.title;
+    elements.jobTitle.disabled = true;
+    elements.criteriaList.replaceChildren();
+    for (const criterion of job.criteria) addCriterion(criterion, false);
+    elements.jobStatus.textContent = `Loaded criteria version ${job.criteria_version}.`;
+    await refreshSavedJobs(job.id);
+    const reviews = await responseJson(await fetch(`/api/jobs/${encodeURIComponent(job.id)}/reviews`, { cache: "no-store" }));
+    renderSavedReviews(reviews.reviews);
+  } catch (error) {
+    showToast(error.message);
+  }
+  updateReviewButton();
+}
+
+async function saveCurrentJob() {
+  const title = elements.jobTitle.value.trim();
+  const criteria = criteriaValues();
+  if (!title || !criteria.length) return;
+  elements.saveJob.disabled = true;
+  try {
+    let saved;
+    if (currentJobId) {
+      saved = await responseJson(await fetch(`/api/jobs/${encodeURIComponent(currentJobId)}/criteria`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ criteria }),
+      }));
+      currentCriteriaSetId = saved.id;
+      elements.jobStatus.textContent = `Saved criteria version ${saved.version}.`;
+    } else {
+      saved = await responseJson(await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, criteria }),
+      }));
+      currentJobId = saved.id;
+      currentCriteriaSetId = saved.criteria_set_id;
+      elements.jobTitle.disabled = true;
+      elements.jobStatus.textContent = "Role and criteria saved locally.";
+    }
+    criteriaDirty = false;
+    await refreshSavedJobs(currentJobId);
+  } catch (error) {
+    showToast(error.message);
+  }
+  updateReviewButton();
+}
+
+function renderSavedReviews(reviews) {
+  elements.resultsList.replaceChildren();
+  if (!reviews.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-results";
+    empty.textContent = "No saved reviews for this role yet.";
+    elements.resultsList.append(empty);
+    elements.clearReviews.disabled = true;
+    return;
+  }
+  for (const item of reviews) {
+    const row = document.createElement("article");
+    row.className = "candidate-result";
+    const heading = document.createElement("div");
+    heading.className = "candidate-result-heading";
+    const title = document.createElement("h3");
+    title.textContent = item.display_label;
+    const timestamp = document.createElement("span");
+    timestamp.textContent = `${item.criteria_count} criteria · ${new Date(item.created_at).toLocaleString()}`;
+    heading.append(title, timestamp);
+    const summary = document.createElement("p");
+    summary.className = "result-summary";
+    summary.textContent = item.summary;
+    row.append(heading, summary);
+    elements.resultsList.append(row);
+  }
+  elements.clearReviews.disabled = false;
+}
+
+function addCriterion(criterion = { name: "", description: "", category: "required" }, focus = true) {
   elements.criteriaList.querySelector(".empty-criteria")?.remove();
   const row = document.createElement("div");
   row.className = "criterion-row";
@@ -153,6 +287,8 @@ function addCriterion(criterion = { name: "", description: "", category: "requir
   remove.setAttribute("aria-label", "Remove criterion");
   remove.addEventListener("click", () => {
     row.remove();
+    criteriaDirty = true;
+    elements.jobStatus.textContent = "Unsaved criteria changes";
     if (!elements.criteriaList.querySelector(".criterion-row")) {
       const empty = document.createElement("div");
       empty.className = "empty-criteria";
@@ -162,12 +298,22 @@ function addCriterion(criterion = { name: "", description: "", category: "requir
     updateReviewButton();
   });
 
-  for (const input of [name, description, category]) input.addEventListener("input", updateReviewButton);
-  category.addEventListener("change", updateReviewButton);
+  for (const input of [name, description, category]) {
+    input.addEventListener("input", () => {
+      criteriaDirty = true;
+      elements.jobStatus.textContent = "Unsaved criteria changes";
+      updateReviewButton();
+    });
+  }
+  category.addEventListener("change", () => {
+    criteriaDirty = true;
+    elements.jobStatus.textContent = "Unsaved criteria changes";
+    updateReviewButton();
+  });
   row.append(fields, category, remove);
   elements.criteriaList.append(row);
   updateReviewButton();
-  name.focus();
+  if (focus) name.focus();
 }
 
 function renderResult(label, result) {
@@ -230,7 +376,107 @@ function renderResult(label, result) {
   elements.clearReviews.disabled = false;
 }
 
+function parsePdfCandidateRanges() {
+  // Page splits must be explicit; guessing equal-sized candidates can mix two applicants.
+  const lines = elements.pdfCandidateRanges.value.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) {
+    const pageStart = Number(elements.pageStart.value);
+    const pageEnd = Number(elements.pageEnd.value);
+    if (!pageStart || !pageEnd || pageStart > pageEnd || pageEnd > pdfPageCount) {
+      throw new Error(`Enter a PDF page range from 1 to ${pdfPageCount}.`);
+    }
+    return [{
+      label: elements.candidateLabel.value.trim() || "Candidate 001",
+      local_reference: "",
+      page_start: pageStart,
+      page_end: pageEnd,
+    }];
+  }
+
+  return lines.map((line, index) => {
+    const [label, startText, endText, localReference = ""] = line.split(",").map((part) => part.trim());
+    const pageStart = Number(startText);
+    const pageEnd = Number(endText);
+    if (!label || !pageStart || !pageEnd || pageStart > pageEnd || pageEnd > pdfPageCount) {
+      throw new Error(`Invalid PDF range on line ${index + 1}. Use: label, first page, last page.`);
+    }
+    return { label, local_reference: localReference, page_start: pageStart, page_end: pageEnd };
+  });
+}
+
+function renderFailedCandidate(item) {
+  const row = document.createElement("article");
+  row.className = "candidate-result";
+  const heading = document.createElement("div");
+  heading.className = "candidate-result-heading";
+  const title = document.createElement("h3");
+  title.textContent = item.label;
+  const status = document.createElement("span");
+  status.className = "assessment-status not_evidenced";
+  status.textContent = "Review failed";
+  heading.append(title, status);
+  const note = document.createElement("p");
+  note.className = "assessment-note";
+  note.textContent = item.error || "No review result was saved.";
+  row.append(heading, note);
+  elements.resultsList.prepend(row);
+}
+
+function renderBatch(batch) {
+  elements.resultsList.replaceChildren();
+  for (const item of [...batch.items].reverse()) {
+    if (item.result) renderResult(item.label, item.result);
+    else if (item.status === "failed") renderFailedCandidate(item);
+  }
+  if (!batch.items.some((item) => item.result || item.status === "failed")) {
+    const empty = document.createElement("p");
+    empty.className = "empty-results";
+    empty.textContent = "The batch completed without saved reviews.";
+    elements.resultsList.append(empty);
+  }
+  elements.clearReviews.disabled = !currentJobId;
+}
+
+async function pollReviewBatch(batchId) {
+  elements.batchProgress.hidden = false;
+  for (;;) {
+    const batch = await responseJson(await fetch(`/api/review-batches/${encodeURIComponent(batchId)}`, { cache: "no-store" }));
+    const done = batch.completed_items + batch.failed_items;
+    elements.batchProgress.max = Math.max(1, batch.total_items);
+    elements.batchProgress.value = done;
+    elements.reviewStatus.textContent = `Reviewing ${done} of ${batch.total_items} candidates · ${batch.completed_items} complete · ${batch.failed_items} failed`;
+    if (["complete", "complete_with_errors"].includes(batch.status)) {
+      renderBatch(batch);
+      elements.reviewStatus.textContent = `Batch finished: ${batch.completed_items} reviewed, ${batch.failed_items} failed. Results saved locally.`;
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+  }
+}
+
 elements.addCriterion.addEventListener("click", () => addCriterion());
+elements.saveJob.addEventListener("click", saveCurrentJob);
+elements.newJob.addEventListener("click", () => {
+  currentJobId = "";
+  currentCriteriaSetId = "";
+  criteriaDirty = false;
+  elements.jobTitle.value = "";
+  elements.jobTitle.disabled = false;
+  elements.savedJobs.value = "";
+  elements.criteriaList.replaceChildren();
+  const empty = document.createElement("div");
+  empty.className = "empty-criteria";
+  empty.textContent = "No criteria added yet.";
+  elements.criteriaList.append(empty);
+  elements.jobStatus.textContent = "New role";
+  renderSavedReviews([]);
+  updateReviewButton();
+});
+elements.jobTitle.addEventListener("input", updateSaveButton);
+elements.savedJobs.addEventListener("change", () => {
+  elements.loadJob.disabled = !elements.savedJobs.value;
+});
+elements.loadJob.addEventListener("click", () => loadSavedJob(elements.savedJobs.value));
 
 elements.extractCriteria.addEventListener("click", async () => {
   const mode = document.querySelector('input[name="announcement-mode"]:checked').value;
@@ -278,6 +524,8 @@ elements.extractCriteria.addEventListener("click", async () => {
     const result = await responseJson(response);
     elements.criteriaList.replaceChildren();
     for (const criterion of result.criteria) addCriterion(criterion);
+    criteriaDirty = true;
+    elements.jobStatus.textContent = "Extracted criteria need to be saved before review.";
     elements.criteriaStatus.textContent = `${result.criteria.length} criteria extracted; review and edit them.${requestId ? ` Request ${requestId}.` : ""}`;
   } catch (error) {
     elements.criteriaStatus.textContent = "Extraction failed.";
@@ -304,8 +552,11 @@ elements.announcementPdf.addEventListener("change", () => {
 elements.candidateDocument.addEventListener("change", async () => {
   selectedFile = elements.candidateDocument.files?.[0] || null;
   selectedDocumentType = null;
+  xmlCandidateGroups = [];
   pdfPageCount = 0;
   elements.pageRange.hidden = true;
+  elements.pdfBatchConfig.hidden = true;
+  elements.xmlBatchConfig.hidden = true;
   if (!selectedFile) {
     elements.fileName.textContent = "Choose a PDF or XML";
     elements.fileDetails.textContent = "PDF page ranges are supported; XML citations use element paths";
@@ -328,8 +579,24 @@ elements.candidateDocument.addEventListener("change", async () => {
       elements.pageStart.value = "1";
       elements.pageEnd.value = String(pdfPageCount);
       elements.pageRange.hidden = false;
+      elements.pdfBatchConfig.hidden = false;
+      elements.pdfCandidateRanges.placeholder = `One candidate per line: label, first page, last page\nCandidate 001, 1, 2\nCandidate 002, 3, 4-5\n\n${pdfPageCount} pages detected`;
     } else {
-      elements.fileDetails.textContent = `XML · ${info.source_count} source paths · ${info.text_chars.toLocaleString()} characters`;
+      xmlCandidateGroups = info.candidate_groups || [];
+      elements.fileDetails.textContent = `XML · ${xmlCandidateGroups.reduce((total, group) => total + group.count, 0)} candidate records · ${info.text_chars.toLocaleString()} reviewable characters`;
+      elements.xmlBatchConfig.hidden = xmlCandidateGroups.length === 0;
+      elements.xmlCandidateGroup.replaceChildren();
+      for (const group of xmlCandidateGroups) {
+        const option = new Option(`${group.path} · ${group.count} candidates`, group.path);
+        elements.xmlCandidateGroup.append(option);
+      }
+      if (xmlCandidateGroups.length) {
+        elements.xmlRecordStart.value = "1";
+        elements.xmlRecordEnd.value = String(xmlCandidateGroups[0].count);
+        elements.xmlRecordEnd.max = String(xmlCandidateGroups[0].count);
+      } else {
+        elements.fileDetails.textContent = `XML · ${info.source_count} text paths · no repeated candidate records detected`;
+      }
     }
   } catch (error) {
     selectedFile = null;
@@ -341,37 +608,64 @@ elements.candidateDocument.addEventListener("change", async () => {
   updateReviewButton();
 });
 
-elements.reviewCandidate.addEventListener("click", async () => {
-  if (!selectedFile || !criteriaValues().length) return;
-  const start = selectedDocumentType === "pdf" ? Number(elements.pageStart.value) : null;
-  const end = selectedDocumentType === "pdf" ? Number(elements.pageEnd.value) : null;
-  if (selectedDocumentType === "pdf" && (!start || !end || start > end || end > pdfPageCount)) {
-    showToast(`Enter a page range from 1 to ${pdfPageCount}.`);
-    return;
+elements.xmlCandidateGroup.addEventListener("change", () => {
+  const group = xmlCandidateGroups.find((item) => item.path === elements.xmlCandidateGroup.value);
+  if (group) {
+    elements.xmlRecordStart.max = String(group.count);
+    elements.xmlRecordEnd.max = String(group.count);
+    elements.xmlRecordStart.value = "1";
+    elements.xmlRecordEnd.value = String(group.count);
   }
+});
 
+elements.reviewCandidate.addEventListener("click", async () => {
+  if (!selectedFile || !currentJobId || !currentCriteriaSetId || criteriaDirty) return;
   const form = new FormData();
   form.append("document", selectedFile);
-  form.append("criteria_json", JSON.stringify({ criteria: criteriaValues() }));
+  form.append("job_id", currentJobId);
+  form.append("criteria_set_id", currentCriteriaSetId);
   if (selectedDocumentType === "pdf") {
-    form.append("page_start", String(start));
-    form.append("page_end", String(end));
+    try {
+      form.append("pdf_ranges_json", JSON.stringify(parsePdfCandidateRanges()));
+    } catch (error) {
+      showToast(error.message);
+      return;
+    }
+  } else {
+    const recordGroup = xmlCandidateGroups.find((group) => group.path === elements.xmlCandidateGroup.value);
+    const start = Number(elements.xmlRecordStart.value);
+    const end = Number(elements.xmlRecordEnd.value);
+    if (!recordGroup || !start || !end || start > end || end > recordGroup.count) {
+      showToast("Choose a valid XML candidate record range.");
+      return;
+    }
+    form.append("xml_record_path", recordGroup.path);
+    form.append("xml_start", String(start));
+    form.append("xml_end", String(end));
   }
-  const label = elements.candidateLabel.value.trim() || selectedFile.name.replace(/\.(pdf|xml)$/i, "") || "Candidate";
+  batchInProgress = true;
   elements.reviewCandidate.disabled = true;
-  elements.reviewStatus.textContent = "Reviewing with local model…";
+  elements.reviewStatus.textContent = "Uploading document to the local app and queuing reviews…";
   try {
-    const response = await fetch("/api/review", { method: "POST", body: form });
-    const requestId = response.headers.get("X-Request-ID");
-    const result = await responseJson(response);
-    renderResult(label, result);
-    elements.reviewStatus.textContent = `Review complete. Verify each note against the original application.${requestId ? ` Request ${requestId}.` : ""}`;
+    const startResponse = await fetch("/api/review-batches", { method: "POST", body: form });
+    const batch = await responseJson(startResponse);
+    elements.reviewStatus.textContent = `Queued ${batch.candidate_count} candidates · batch ${batch.batch_id.slice(0, 8)}`;
+    await pollReviewBatch(batch.batch_id);
   } catch (error) {
     elements.reviewStatus.textContent = "Review failed.";
     showToast(error.message);
   } finally {
+    batchInProgress = false;
     updateReviewButton();
   }
+});
+
+elements.exportReviews.addEventListener("click", () => {
+  if (currentJobId) window.location.assign(`/api/jobs/${encodeURIComponent(currentJobId)}/export.csv`);
+});
+
+elements.exportDemographics.addEventListener("click", () => {
+  if (currentJobId) window.location.assign(`/api/jobs/${encodeURIComponent(currentJobId)}/demographics.csv`);
 });
 
 elements.clearReviews.addEventListener("click", () => {
@@ -380,7 +674,9 @@ elements.clearReviews.addEventListener("click", () => {
   empty.className = "empty-results";
   empty.textContent = "Candidate reviews will appear here.";
   elements.resultsList.append(empty);
-  elements.clearReviews.disabled = true;
+  elements.clearReviews.disabled = !currentJobId;
 });
 
+refreshSavedJobs().catch((error) => showToast(error.message));
+updateReviewButton();
 checkModel();

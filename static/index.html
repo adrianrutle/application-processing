@@ -27,12 +27,12 @@
           <h1>Application review</h1>
           <p class="heading-copy">Compare submitted evidence with the requirements of the role.</p>
         </div>
-        <div class="session-tag"><span class="session-dot"></span> Session-only workspace</div>
+        <div class="session-tag"><span class="session-dot"></span> Local SQLite workspace</div>
       </section>
 
       <div class="privacy-note" id="privacy-note">
         <span class="privacy-icon" aria-hidden="true">LOCAL</span>
-        <p>Candidate documents are processed by the loopback model endpoint only. This app does not save submissions or send them to a cloud service.</p>
+        <p>Candidate files and model text stay on this machine. Original PDFs/XML are not saved; reviews and selected demographics are stored in a local SQLite database.</p>
       </div>
 
       <section class="workspace" aria-label="Candidate review workspace">
@@ -43,6 +43,20 @@
               <h2 id="role-heading">Role criteria</h2>
               <p>Start with the published announcement.</p>
             </div>
+          </div>
+          <label class="field-label" for="job-title">Role name</label>
+          <div class="job-row">
+            <input id="job-title" type="text" maxlength="200" placeholder="For example, Thermal Modelling PhD" />
+            <button class="button button-primary" id="save-job" type="button" disabled>Save role</button>
+            <button class="button button-quiet" id="new-job" type="button">New role</button>
+          </div>
+          <div class="job-row job-load-row">
+            <label class="visually-hidden" for="saved-jobs">Saved roles</label>
+            <select id="saved-jobs">
+              <option value="">Choose a saved role</option>
+            </select>
+            <button class="button button-quiet" id="load-job" type="button" disabled>Load</button>
+            <span class="inline-status" id="job-status" aria-live="polite"></span>
           </div>
           <span class="field-label">Announcement source</span>
           <div class="source-modes" role="radiogroup" aria-label="Announcement source type">
@@ -78,7 +92,7 @@
           <div class="criteria-heading">
             <div>
               <h3>Review criteria</h3>
-              <p>Editable before you review applications.</p>
+              <p>Save this version before reviewing applications.</p>
             </div>
             <button class="button button-quiet" id="add-criterion" type="button">Add criterion</button>
           </div>
@@ -92,7 +106,7 @@
             <span class="step-number">02</span>
             <div>
               <h2 id="candidate-heading">Candidate document</h2>
-              <p>PDF or XML, one candidate per review.</p>
+              <p>Review candidates from explicit PDF page ranges or XML records.</p>
             </div>
           </div>
 
@@ -117,12 +131,27 @@
             <label>From <input id="page-start" type="number" min="1" value="1" /></label>
             <label>To <input id="page-end" type="number" min="1" value="1" /></label>
           </div>
+          <div class="pdf-batch-config" id="pdf-batch-config" hidden>
+            <label class="field-label" for="pdf-candidate-ranges">Candidate page ranges</label>
+            <textarea id="pdf-candidate-ranges" rows="5" placeholder="One candidate per line: label, first page, last page&#10;Candidate 001, 1, 2&#10;Candidate 002, 3, 5"></textarea>
+            <p class="source-hint">Ranges must identify one applicant each and must not overlap. The app will not guess candidate boundaries.</p>
+          </div>
+          <div class="xml-batch-config" id="xml-batch-config" hidden>
+            <label class="field-label" for="xml-candidate-group">XML candidate records</label>
+            <select id="xml-candidate-group"></select>
+            <div class="xml-record-range">
+              <label>From <input id="xml-record-start" type="number" min="1" value="1" /></label>
+              <label>To <input id="xml-record-end" type="number" min="1" value="1" /></label>
+            </div>
+            <p class="source-hint">Structured XML demographics are retained only in the local database; they are removed from model input.</p>
+          </div>
 
           <div class="review-action">
-            <button class="button button-primary" id="review-candidate" type="button" disabled>Review candidate</button>
+            <button class="button button-primary" id="review-candidate" type="button" disabled>Start review batch</button>
             <span class="inline-status" id="review-status" aria-live="polite"></span>
           </div>
-          <p class="privacy-footnote">Scanned PDFs need OCR first. Reviews are evidence notes, not hiring recommendations.</p>
+          <progress id="batch-progress" max="1" value="0" hidden></progress>
+          <p class="privacy-footnote">Scanned PDFs need OCR first. Uploaded files are not saved. Reviews and XML demographics are saved locally.</p>
         </section>
       </section>
 
@@ -135,7 +164,11 @@
               <p>Evidence is shown with source page references.</p>
             </div>
           </div>
-          <button class="button button-quiet" id="clear-reviews" type="button" disabled>Clear reviews</button>
+          <div class="export-actions">
+            <button class="button button-quiet" id="export-reviews" type="button" disabled>Export review CSV</button>
+            <button class="button button-quiet" id="export-demographics" type="button" disabled>Export demographics CSV</button>
+            <button class="button button-quiet" id="clear-reviews" type="button" disabled>Clear view</button>
+          </div>
         </div>
         <div class="results-list" id="results-list">
           <p class="empty-results">Candidate reviews will appear here.</p>

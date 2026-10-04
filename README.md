@@ -1,6 +1,6 @@
 # Application Review
 
-A local-first tool for comparing candidate application PDFs or XML with job-related criteria. Candidate documents are processed only by a loopback Ollama or LM Studio endpoint. The app does not save applications, CVs, criteria, or review results between browser sessions.
+A local-first tool for comparing candidate application PDFs or XML with saved, job-related criteria. Candidate documents are processed only by a loopback Ollama or LM Studio endpoint.
 
 **Run this on your own computer before using real applicant data.** A Codespace or other remote development container is not your device: uploaded PDFs and XML files are transferred to that remote machine even though model inference uses its local model endpoint. The app detects Codespaces and displays a warning.
 
@@ -48,13 +48,18 @@ If your LM Studio server requires an API key, export `LM_STUDIO_API_KEY` in the 
 ## Review flow
 
 1. Paste an announcement, upload its PDF, or enter its public HTTPS URL; extract criteria with the local model.
-2. Edit the criteria; add or remove items as needed.
-3. Select a candidate PDF or XML. For a combined PDF, enter the candidate's page range; XML evidence cites element paths.
-4. Review the evidence notes and check each citation against the original document.
+2. Edit and save the role. Criteria changes are stored as a new version.
+3. Select a candidate PDF and enter one page range per applicant, or select an XML candidate element and record range.
+4. Start the batch and monitor per-candidate progress. Each candidate is reviewed in a separate model request.
+5. Review the evidence notes, then export the review CSV or the separate demographics CSV.
 
-The app handles text-based PDFs and XML up to 50 MB. Image-only scans need OCR before use. Large PDFs can be reviewed in smaller page ranges. Announcement URLs must use HTTPS, resolve to public IP addresses, and not redirect. Application documents are parsed for the request and are not added to a database; multipart uploads may be temporarily spooled by the web framework to the machine's system temporary directory. Review results stay in browser memory until the page is closed or cleared.
+The app handles text-based PDFs and XML up to 50 MB. Image-only scans need OCR before use. PDF candidate ranges must be entered explicitly; the app never guesses boundaries from equal page counts. Jobbnorge-style XML exports are split by repeated `Candidate` elements (for the example structure, `/Jobbnorge_Export/Candidates/Candidate`). Announcement URLs must use HTTPS, resolve to public IP addresses, and not redirect.
 
-Each XML upload is currently reviewed as one candidate document; the app does not split a multi-applicant XML export. The displayed XML source count is the number of distinct text-bearing element/attribute paths, not the number of candidates.
+Uploaded PDFs/XML are processed from the request and are not saved. The SQLite database stores job titles, criteria versions, applicant references, structured demographics extracted from XML, review results, and evidence excerpts. Demographics are in a separate table and are not included in model input or the standard review CSV; a separate demographics CSV is available explicitly. PDF demographics are not yet extracted into that table. Applicant files and their text are not stored as files in SQLite.
+
+On macOS the default database is `~/Library/Application Support/Application Review/applications.sqlite3`; on Linux it is `$XDG_DATA_HOME/application-review/applications.sqlite3` or `~/.local/share/application-review/applications.sqlite3`. Override it with `APPLICATION_DB_PATH`. Docker Compose stores it in the persistent `application-review-data` volume. SQLite is not encrypted by the app; protect the computer/database with OS disk encryption and restrict access. Back up and delete the database according to your retention policy.
+
+The XML source count is the number of distinct text-bearing element/attribute paths, not the number of candidates. XML direct identifier and demographic elements are excluded from model text; matching literal values, email addresses, and phone-like strings are also redacted locally from extracted text. PDF labels, emails, and phone-like strings receive heuristic redaction, but this is not guaranteed anonymization. Free-form applicant text may still identify someone; verify redaction before relying on it. All model requests remain local regardless.
 
 The console emits request-correlated pipeline diagnostics: document type, page/path counts, text character counts, model/response type, token counts when supplied, JSON parsing/schema outcome, verified citation counts, request status, and duration. The UI shows the same request ID after completion or in an error, so its `request_id` log entries are easy to find. It deliberately does not log document text, prompts, or raw model output because those may contain applicant data. Each API response includes its request ID in the `X-Request-ID` header.
 
@@ -63,9 +68,9 @@ Model calls have a 600-second timeout by default because local reasoning models 
 ## Scope and safeguards
 
 - The model extracts explicit job-related criteria and compares application text with those criteria; it does not rank candidates or recommend hiring decisions.
-- Candidate labels are not sent to the model. Evidence quotes are checked against extracted PDF text or XML element content before they are displayed.
+- Candidate labels and locally stored demographic fields are not sent to the model. Evidence quotes are checked against extracted PDF text or XML element content before they are displayed.
 - Missing information is not treated as proof that a candidate lacks a qualification. Review labels are prompts for human verification, not findings of fact.
-- This MVP sends candidate text only to a loopback Ollama or LM Studio service and blocks Ollama models tagged `:cloud`. It has no cloud LLM mode, anonymization service, OCR, or persistent storage.
+- This MVP sends candidate text only to a loopback Ollama or LM Studio service and blocks Ollama models tagged `:cloud`. It has no cloud LLM mode, guaranteed anonymization, or OCR.
 - A local model can still produce inaccurate or biased output. Use consistent job-related criteria, review the source pages, and make decisions yourself.
 
 ## Tests
