@@ -65,6 +65,8 @@ The console emits request-correlated pipeline diagnostics: document type, page/p
 
 Model calls have a 600-second timeout by default because local reasoning models can take several minutes. Set `LLM_REQUEST_TIMEOUT_SECONDS` to change it. The console distinguishes `model.request.timeout` from `model.request.cancelled` and `http.cancelled` events, so a disconnect is not automatically mistaken for a timeout.
 
+Criteria extraction is queued by the app and the browser polls for its result, so a slow local model does not hold the initial browser request open until an upstream gateway times out. Extraction tasks are kept in memory for up to one hour after completion and are lost if the app process restarts.
+
 ## Scope and safeguards
 
 - The model extracts explicit job-related criteria and compares application text with those criteria; it does not rank candidates or recommend hiring decisions.

@@ -2,6 +2,7 @@ import json
 import io
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -53,6 +54,58 @@ class ApplicationPersistenceApiTests(unittest.TestCase):
         self.assertEqual(update.status_code, 200, update.text)
         self.assertEqual(update.json()["version"], 2)
         self.assertEqual(self.client.get(f"/api/jobs/{job['id']}").json()["criteria_version"], 2)
+
+    def test_criteria_extraction_queues_and_returns_results(self):
+        async def fake_extract(announcement):
+            self.assertIn("Thermal modelling", announcement)
+            return app_module.CriteriaResponse(
+                criteria=[
+                    app_module.Criterion(
+                        name="CFD",
+                        description="Experience with computational fluid dynamics",
+                        category="required",
+                    )
+                ]
+            )
+
+        with patch.object(app_module, "extract_criteria_for_text", fake_extract):
+            started = self.client.post(
+                "/api/criteria",
+                json={"announcement": "Thermal modelling role requiring extensive CFD experience."},
+            )
+            self.assertEqual(started.status_code, 202, started.text)
+            task_id = started.json()["task_id"]
+            for _ in range(50):
+                result = self.client.get(f"/api/criteria-tasks/{task_id}")
+                if result.json()["status"] in {"complete", "failed"}:
+                    break
+                time.sleep(0.01)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["status"], "complete")
+        self.assertEqual(result.json()["criteria"][0]["name"], "CFD")
+
+    def test_criteria_extraction_failure_is_available_from_task_status(self):
+        async def failed_extract(announcement):
+            raise app_module.HTTPException(status_code=504, detail="LM Studio timed out.")
+
+        with patch.object(app_module, "extract_criteria_for_text", failed_extract):
+            started = self.client.post(
+                "/api/criteria",
+                json={"announcement": "Thermal modelling role requiring extensive CFD experience."},
+            )
+            self.assertEqual(started.status_code, 202, started.text)
+            task_id = started.json()["task_id"]
+            for _ in range(50):
+                result = self.client.get(f"/api/criteria-tasks/{task_id}")
+                if result.json()["status"] in {"complete", "failed"}:
+                    break
+                time.sleep(0.01)
+
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["status"], "failed")
+        self.assertEqual(result.json()["error_status"], 504)
+        self.assertEqual(result.json()["detail"], "LM Studio timed out.")
 
     def test_xml_batch_reviews_each_candidate_and_keeps_demographics_out_of_model_text(self):
         job = self.create_job()

@@ -125,6 +125,9 @@ class PdfCandidateRange(BaseModel):
 
 MAX_BATCH_CANDIDATES = 100
 batch_tasks: set[asyncio.Task] = set()
+CRITERIA_TASK_RETENTION_SECONDS = 3600
+criteria_extraction_tasks: dict[str, dict] = {}
+criteria_extraction_workers: set[asyncio.Task] = set()
 
 
 def extract_pdf_pages(file_obj, page_start: int = 1, page_end: int | None = None):
@@ -876,23 +879,102 @@ async def extract_criteria_for_text(announcement: str) -> CriteriaResponse:
         raise HTTPException(status_code=502, detail="The local model returned invalid criteria.") from exc
 
 
-@app.post("/api/criteria", response_model=CriteriaResponse)
+def prune_criteria_extraction_tasks():
+    now = time.monotonic()
+    expired = [
+        task_id
+        for task_id, task in criteria_extraction_tasks.items()
+        if task.get("finished_at") is not None
+        and now - task["finished_at"] > CRITERIA_TASK_RETENTION_SECONDS
+    ]
+    for task_id in expired:
+        del criteria_extraction_tasks[task_id]
+
+
+async def process_criteria_extraction(task_id: str, announcement: str):
+    criteria_extraction_tasks[task_id] = {"status": "processing"}
+    try:
+        criteria = await extract_criteria_for_text(announcement)
+        criteria_extraction_tasks[task_id] = {
+            "status": "complete",
+            "criteria": [item.model_dump() for item in criteria.criteria],
+            "finished_at": time.monotonic(),
+        }
+    except asyncio.CancelledError:
+        criteria_extraction_tasks[task_id] = {
+            "status": "failed",
+            "detail": "Criteria extraction was interrupted; try again.",
+            "error_status": 503,
+            "finished_at": time.monotonic(),
+        }
+        log_pipeline_event("criteria.extraction.cancelled", task_id=task_id)
+        raise
+    except HTTPException as exc:
+        criteria_extraction_tasks[task_id] = {
+            "status": "failed",
+            "detail": exc.detail,
+            "error_status": exc.status_code,
+            "finished_at": time.monotonic(),
+        }
+        log_pipeline_event(
+            "criteria.extraction.failed",
+            task_id=task_id,
+            status=exc.status_code,
+        )
+    except Exception as exc:
+        criteria_extraction_tasks[task_id] = {
+            "status": "failed",
+            "detail": "Unexpected criteria extraction error; inspect the server log.",
+            "error_status": 500,
+            "finished_at": time.monotonic(),
+        }
+        log_pipeline_event(
+            "criteria.extraction.error",
+            task_id=task_id,
+            error_type=type(exc).__name__,
+        )
+
+
+async def queue_criteria_extraction(announcement: str) -> dict:
+    announcement = announcement.strip()
+    if len(announcement) < 30:
+        raise HTTPException(status_code=422, detail="Provide at least 30 characters of announcement text.")
+    prune_criteria_extraction_tasks()
+    task_id = uuid.uuid4().hex
+    criteria_extraction_tasks[task_id] = {"status": "queued"}
+    task = asyncio.create_task(process_criteria_extraction(task_id, announcement))
+    criteria_extraction_workers.add(task)
+    task.add_done_callback(criteria_extraction_workers.discard)
+    log_pipeline_event("criteria.extraction.queued", task_id=task_id)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/api/criteria", status_code=202)
 async def extract_criteria(request: CriteriaRequest):
-    return await extract_criteria_for_text(request.announcement)
+    return await queue_criteria_extraction(request.announcement)
 
 
-@app.post("/api/criteria-pdf", response_model=CriteriaResponse)
+@app.post("/api/criteria-pdf", status_code=202)
 async def extract_criteria_from_pdf(announcement_pdf: UploadFile = File(...)):
     if detect_document_type(announcement_pdf) != "pdf":
         raise HTTPException(status_code=415, detail="Upload the announcement as a PDF.")
     _, pages = extract_pdf_pages(announcement_pdf.file)
-    return await extract_criteria_for_text("\n".join(pages.values()))
+    return await queue_criteria_extraction("\n".join(pages.values()))
 
 
-@app.post("/api/criteria-url", response_model=CriteriaResponse)
+@app.post("/api/criteria-url", status_code=202)
 async def extract_criteria_from_url(request: AnnouncementUrlRequest):
     announcement = await fetch_public_announcement(request.url)
-    return await extract_criteria_for_text(announcement)
+    return await queue_criteria_extraction(announcement)
+
+
+@app.get("/api/criteria-tasks/{task_id}")
+async def get_criteria_extraction_task(task_id: str):
+    prune_criteria_extraction_tasks()
+    task = criteria_extraction_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Criteria extraction task not found or expired.")
+    return {key: value for key, value in task.items() if key != "finished_at"} | {"task_id": task_id}
 
 
 async def evaluate_candidate_sources(

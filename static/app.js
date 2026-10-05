@@ -316,6 +316,18 @@ function addCriterion(criterion = { name: "", description: "", category: "requir
   if (focus) name.focus();
 }
 
+async function pollCriteriaExtraction(taskId) {
+  while (true) {
+    const task = await responseJson(await fetch(`/api/criteria-tasks/${encodeURIComponent(taskId)}`, { cache: "no-store" }));
+    if (task.status === "complete") return task;
+    if (task.status === "failed") throw new Error(task.detail || "Criteria extraction failed.");
+    elements.criteriaStatus.textContent = task.status === "queued"
+      ? "Waiting for the local model…"
+      : "Extracting with local model…";
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+  }
+}
+
 function renderResult(label, result) {
   const container = document.createElement("article");
   container.className = "candidate-result";
@@ -517,11 +529,12 @@ elements.extractCriteria.addEventListener("click", async () => {
     };
   }
   elements.extractCriteria.disabled = true;
-  elements.criteriaStatus.textContent = "Extracting with local model…";
+  elements.criteriaStatus.textContent = "Queueing criteria extraction…";
   try {
     const response = await fetch(endpoint, requestOptions);
     const requestId = response.headers.get("X-Request-ID");
-    const result = await responseJson(response);
+    const queued = await responseJson(response);
+    const result = await pollCriteriaExtraction(queued.task_id);
     elements.criteriaList.replaceChildren();
     for (const criterion of result.criteria) addCriterion(criterion);
     criteriaDirty = true;
