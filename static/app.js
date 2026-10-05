@@ -44,6 +44,8 @@ const elements = {
   exportDemographics: document.querySelector("#export-demographics"),
 };
 
+const CRITERIA_POLL_INTERVAL_MS = 10_000;
+
 let modelReady = false;
 let selectedFile = null;
 let selectedDocumentType = null;
@@ -324,7 +326,7 @@ async function pollCriteriaExtraction(taskId) {
     elements.criteriaStatus.textContent = task.status === "queued"
       ? "Waiting for the local model…"
       : "Extracting with local model…";
-    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    await new Promise((resolve) => window.setTimeout(resolve, CRITERIA_POLL_INTERVAL_MS));
   }
 }
 
