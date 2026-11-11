@@ -6,6 +6,7 @@ from storage import (
     create_batch,
     create_job,
     export_rows,
+    fail_interrupted_batches,
     get_batch,
     get_job,
     list_job_demographics,
@@ -101,6 +102,34 @@ class SQLiteStorageTests(unittest.TestCase):
         demographics = list_job_demographics(job["id"], self.database)
         self.assertEqual({row["field_name"] for row in demographics}, {"GenderName", "BirthDate"})
         self.assertNotIn("GenderName", rows[0])
+
+    def test_marks_batches_interrupted_by_restart_as_failed(self):
+        job = create_job(
+            "Thermal Modelling PhD",
+            [{"name": "CFD", "description": "CFD experience", "category": "required"}],
+            self.database,
+        )
+        candidates = [
+            {
+                "local_reference": f"candidate-{number}",
+                "display_label": f"Candidate {number}",
+                "source_type": "pdf",
+                "source_reference": f"Pages {number}-{number}",
+            }
+            for number in (1, 2)
+        ]
+        batch_id = create_batch(job["id"], job["criteria_set_id"], candidates, self.database)
+        set_batch_status(batch_id, "processing", self.database)
+        first_item = get_batch(batch_id, self.database)["items"][0]
+        set_batch_item_status(first_item["id"], "processing", path=self.database)
+
+        self.assertEqual(fail_interrupted_batches(self.database), 1)
+
+        batch = get_batch(batch_id, self.database)
+        self.assertEqual(batch["status"], "complete_with_errors")
+        self.assertEqual(batch["failed_items"], 2)
+        self.assertTrue(all("app stopped" in item["error"] for item in batch["items"]))
+        self.assertEqual(fail_interrupted_batches(self.database), 0)
 
 
 if __name__ == "__main__":

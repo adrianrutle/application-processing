@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from app import (
     app,
     CriteriaResponse,
+    csv_response,
     decode_model_json,
     extract_pdf_pages,
     extract_xml_candidate_sources,
@@ -218,6 +219,26 @@ class PdfProcessingTests(unittest.TestCase):
         self.assertNotIn("Example", text)
         self.assertNotIn("ada@example.test", text)
         self.assertNotIn("+47 123 45 678", text)
+
+    def test_redacts_short_codes_case_sensitively(self):
+        redacted = redact_candidate_sources(
+            {"/Candidate[1]/Text[1]": "I have no PhD yet, but NO and Norge appear here."},
+            {"CitizenshipCode": "NO", "CitizenshipName": "Norge"},
+        )
+        text = next(iter(redacted.values()))
+        self.assertIn("I have no PhD yet", text)
+        self.assertNotIn("NO and", text)
+        self.assertNotIn("Norge", text)
+
+    def test_csv_export_neutralizes_spreadsheet_formulas(self):
+        response = csv_response(
+            [{"notes": "=HYPERLINK(1)"}, {"notes": "\t=1+1"}, {"notes": "plain"}],
+            "export.csv",
+        )
+        lines = response.body.decode("utf-8-sig").splitlines()
+        self.assertEqual(lines[1], "'=HYPERLINK(1)")
+        self.assertEqual(lines[2], "'\t=1+1")
+        self.assertEqual(lines[3], "plain")
 
     def test_document_info_accepts_xml_upload(self):
         client = TestClient(app)

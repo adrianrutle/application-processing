@@ -595,7 +595,7 @@ elements.candidateDocument.addEventListener("change", async () => {
       elements.pageEnd.value = String(pdfPageCount);
       elements.pageRange.hidden = false;
       elements.pdfBatchConfig.hidden = false;
-      elements.pdfCandidateRanges.placeholder = `One candidate per line: label, first page, last page\nCandidate 001, 1, 2\nCandidate 002, 3, 4-5\n\n${pdfPageCount} pages detected`;
+      elements.pdfCandidateRanges.placeholder = `One candidate per line: label, first page, last page\nCandidate 001, 1, 2\nCandidate 002, 3, 5\n\n${pdfPageCount} pages detected`;
     } else {
       xmlCandidateGroups = info.candidate_groups || [];
       elements.fileDetails.textContent = `XML · ${xmlCandidateGroups.reduce((total, group) => total + group.count, 0)} candidate records · ${info.text_chars.toLocaleString()} reviewable characters`;
@@ -607,6 +607,7 @@ elements.candidateDocument.addEventListener("change", async () => {
       }
       if (xmlCandidateGroups.length) {
         elements.xmlRecordStart.value = "1";
+        elements.xmlRecordStart.max = String(xmlCandidateGroups[0].count);
         elements.xmlRecordEnd.value = String(xmlCandidateGroups[0].count);
         elements.xmlRecordEnd.max = String(xmlCandidateGroups[0].count);
       } else {

@@ -442,6 +442,27 @@ def save_review(
         _refresh_batch_counts(connection, batch["batch_id"], now)
 
 
+def fail_interrupted_batches(path: str | Path | None = None) -> int:
+    # Batch workers live in the app process, so unfinished items cannot resume after a restart.
+    with connect(path) as connection:
+        batch_ids = [
+            row["batch_id"]
+            for row in connection.execute(
+                "SELECT DISTINCT batch_id FROM batch_items WHERE status IN ('queued', 'processing')"
+            ).fetchall()
+        ]
+        if not batch_ids:
+            return 0
+        connection.execute(
+            "UPDATE batch_items SET status = 'failed', error = ? WHERE status IN ('queued', 'processing')",
+            ("The app stopped before this candidate was reviewed; start a new batch.",),
+        )
+        now = utc_now()
+        for batch_id in batch_ids:
+            _refresh_batch_counts(connection, batch_id, now)
+    return len(batch_ids)
+
+
 def _refresh_batch_counts(connection: sqlite3.Connection, batch_id: str, now: str):
     row = connection.execute(
         "SELECT COUNT(*) AS total, SUM(status = 'complete') AS complete, SUM(status = 'failed') AS failed, SUM(status IN ('queued', 'processing')) AS pending FROM batch_items WHERE batch_id = ?",

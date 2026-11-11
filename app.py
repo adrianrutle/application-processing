@@ -8,6 +8,7 @@ import re
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from html.parser import HTMLParser
@@ -68,7 +69,15 @@ XML_EXCLUDED_TAGS = {
     "hasredundancycertificate",
 }
 
-app = FastAPI(title="Application Review", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    interrupted = storage.fail_interrupted_batches()
+    if interrupted:
+        log_pipeline_event("batch.interrupted.recovered", batch_count=interrupted)
+    yield
+
+
+app = FastAPI(title="Application Review", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
@@ -280,31 +289,6 @@ def extract_xml_candidate_sources(file_obj, record_path: str, record_index: int)
     return sources
 
 
-def extract_xml_candidate_demographics(file_obj, record_path: str, record_index: int) -> tuple[str, dict[str, str]]:
-    root = parse_xml_root(file_obj)
-    records = find_xml_records(root, record_path)
-    if record_index < 1 or record_index > len(records):
-        raise HTTPException(status_code=422, detail="XML candidate index is out of range.")
-
-    private_fields = {}
-    source_record_id = ""
-    for child in records[record_index - 1]:
-        if not isinstance(child.tag, str):
-            continue
-        field_name = xml_local_name(child.tag)
-        normalized_name = field_name.casefold()
-        if normalized_name not in XML_EXCLUDED_TAGS:
-            continue
-        value = " ".join("".join(child.itertext()).split())
-        if not value:
-            continue
-        if normalized_name == "id":
-            source_record_id = value
-        else:
-            private_fields[field_name] = value
-    return source_record_id, private_fields
-
-
 def extract_xml_candidate_demographics_from_root(root, record_path: str, record_index: int) -> tuple[str, dict[str, str]]:
     records = find_xml_records(root, record_path)
     if record_index < 1 or record_index > len(records):
@@ -324,21 +308,22 @@ def extract_xml_candidate_demographics_from_root(root, record_path: str, record_
             continue
         if normalized_name == "id":
             source_record_id = value
-            private_fields[field_name] = value
-        else:
-            private_fields[field_name] = value
+        private_fields[field_name] = value
     return source_record_id, private_fields
 
 
 def redact_candidate_sources(sources: dict[str, str], private_fields: dict[str, str] | None = None) -> dict[str, str]:
     private_values = []
     for field_name, value in (private_fields or {}).items():
-        if field_name.casefold().startswith(("is", "has")):
+        normalized_name = field_name.casefold()
+        if normalized_name.startswith(("is", "has")):
             continue
         normalized = " ".join(str(value).split())
         if len(normalized) >= 2:
-            private_values.append(normalized)
-    private_values.sort(key=len, reverse=True)
+            # Short codes such as CitizenshipCode "NO" must not redact ordinary words like "no".
+            flags = 0 if normalized_name.endswith("code") else re.IGNORECASE
+            private_values.append((normalized, flags))
+    private_values.sort(key=lambda item: len(item[0]), reverse=True)
 
     email_pattern = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
     phone_pattern = re.compile(r"(?<!\w)\+?\d[\d ().-]{6,}\d(?!\w)")
@@ -351,9 +336,9 @@ def redact_candidate_sources(sources: dict[str, str], private_fields: dict[str, 
     redacted = {}
     for reference, original_text in sources.items():
         text = original_text
-        for value in private_values:
+        for value, flags in private_values:
             pattern = rf"(?<!\w){re.escape(value)}(?!\w)"
-            text = re.sub(pattern, "[REDACTED]", text, flags=re.IGNORECASE)
+            text = re.sub(pattern, "[REDACTED]", text, flags=flags)
         text = email_pattern.sub("[REDACTED]", text)
         text = phone_pattern.sub("[REDACTED]", text)
         text = "\n".join(
@@ -743,7 +728,10 @@ async def status():
         )
         return status_data
     except httpx.HTTPStatusError as exc:
-        status_data["error"] = f"LM Studio returned HTTP {exc.response.status_code}; check its API key and server settings."
+        if provider == "lmstudio":
+            status_data["error"] = f"LM Studio returned HTTP {exc.response.status_code}; check its API key and server settings."
+        else:
+            status_data["error"] = f"Ollama returned HTTP {exc.response.status_code}; check its server settings."
         return status_data
     except (httpx.HTTPError, ValueError):
         return status_data
@@ -761,7 +749,7 @@ def csv_response(rows: list[dict], filename: str) -> Response:
         safe_row = {}
         for key, value in row.items():
             text = "" if value is None else str(value)
-            safe_row[key] = f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
+            safe_row[key] = f"'{text}" if text.startswith(("=", "+", "-", "@", "\t", "\r")) else text
         writer.writerow(safe_row)
     return Response(
         content="\ufeff" + output.getvalue(),
