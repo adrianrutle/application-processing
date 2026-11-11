@@ -78,6 +78,10 @@ async function checkModel() {
   try {
     const status = await responseJson(await fetch("/api/status", { cache: "no-store" }));
     elements.endpointLabel.textContent = `Model endpoint: ${status.endpoint}`;
+    if (status.provider === "demo") {
+      elements.privacyNote.classList.add("is-warning");
+      elements.privacyNote.querySelector("p").textContent = "Demo mode: every answer is fictional and nothing is sent to a server or model. Chosen files are not read. Do not use real applications; run the app on your own machine for real reviews.";
+    }
     if (status.running_in_codespaces) {
       elements.privacyNote.classList.add("is-warning");
       elements.privacyNote.querySelector("p").textContent = "This app is running in a remote Codespace. Uploading a candidate PDF or XML sends it from your device to that remote machine. Do not use real applications here; run the app on your own machine for private reviews.";
@@ -114,7 +118,8 @@ async function checkModel() {
     }
     modelReady = true;
     elements.modelStatus.className = "model-status is-ready";
-    elements.modelStatusText.textContent = `${status.provider === "lmstudio" ? "LM Studio ready" : "Ollama ready"} · ${status.model}`;
+    const providerLabel = ({ lmstudio: "LM Studio ready", demo: "Demo mode" })[status.provider] || "Ollama ready";
+    elements.modelStatusText.textContent = `${providerLabel} · ${status.model}`;
     elements.extractCriteria.disabled = false;
     updateReviewButton();
   } catch {
@@ -676,12 +681,28 @@ elements.reviewCandidate.addEventListener("click", async () => {
   }
 });
 
+// Downloads go through fetch so demo mode can answer them in the browser as well.
+async function downloadExport(path) {
+  try {
+    const response = await fetch(path, { cache: "no-store" });
+    if (!response.ok) await responseJson(response);
+    const filename = (response.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || "export.csv";
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(await response.blob());
+    link.download = filename;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 elements.exportReviews.addEventListener("click", () => {
-  if (currentJobId) window.location.assign(`/api/jobs/${encodeURIComponent(currentJobId)}/export.csv`);
+  if (currentJobId) downloadExport(`/api/jobs/${encodeURIComponent(currentJobId)}/export.csv`);
 });
 
 elements.exportDemographics.addEventListener("click", () => {
-  if (currentJobId) window.location.assign(`/api/jobs/${encodeURIComponent(currentJobId)}/demographics.csv`);
+  if (currentJobId) downloadExport(`/api/jobs/${encodeURIComponent(currentJobId)}/demographics.csv`);
 });
 
 elements.clearReviews.addEventListener("click", () => {

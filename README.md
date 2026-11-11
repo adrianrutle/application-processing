@@ -45,6 +45,12 @@ Open <http://127.0.0.1:8000>. Docker Desktop routes `host.docker.internal` from 
 
 If your LM Studio server requires an API key, export `LM_STUDIO_API_KEY` in the same terminal before starting Compose. To select a specific loaded model, export `LM_STUDIO_MODEL` to its ID first. Do not enable LM Studio's network-wide access unless required; `host.docker.internal` is intended to connect the container to the Mac host.
 
+### Demo on GitHub Pages
+
+The `Demo on GitHub Pages` workflow publishes the static UI on every push to `main`. On a `*.github.io` address the page runs in demo mode: `static/demo.js` answers every API call in the browser with fictional data, so no file is read and nothing is sent to a server or model. Enable it once under **Settings → Pages → Source: GitHub Actions**.
+
+To try demo mode locally, start the app as above and open <http://127.0.0.1:8000/?demo>. Without `?demo` the local app works normally with your local model.
+
 ## Review flow
 
 1. Paste an announcement, upload its PDF, or enter its public HTTPS URL; extract criteria with the local model.
