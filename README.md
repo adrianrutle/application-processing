@@ -23,6 +23,23 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 
 Open <http://127.0.0.1:8000>. The default Ollama endpoint is `http://127.0.0.1:11434`; configure a different **loopback** address with `OLLAMA_BASE_URL` or choose another installed model with `OLLAMA_MODEL`. The app blocks model endpoints that are not loopback addresses. Keep the web app bound to `127.0.0.1`.
 
+### Choosing a stronger local model
+
+`llama3.2:3b` is small enough to run anywhere, but it often misses criteria and evidence. For real reviews use a larger instruction model that fits your memory, for example:
+
+| Memory (RAM / unified) | Ollama model | Approx. download |
+| --- | --- | --- |
+| 16 GB | `qwen2.5:7b` | 4.7 GB |
+| 24–32 GB | `qwen2.5:14b` | 9 GB |
+| 32 GB or more | `gpt-oss:20b` or `qwen2.5:32b` | 14–20 GB |
+
+```sh
+ollama pull qwen2.5:14b
+OLLAMA_MODEL=qwen2.5:14b uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+The app asks Ollama for output that follows the expected JSON schema and sets the context window with `OLLAMA_NUM_CTX` (default `32768` tokens; Ollama's own default would silently cut long applications). A larger context needs more memory; lower it if the model fails to load, raise it if the app reports that a text is too long for the model context. Reasoning output (`<think>` blocks) and Markdown code fences around the JSON are removed before parsing, so reasoning models in LM Studio also work.
+
 ### LM Studio on macOS
 
 In LM Studio, load your Qwen model and start its local server from the Developer/Local Server view on port `1234`. Then run the app from this project on the Mac:

@@ -30,6 +30,8 @@ BASE_DIR = Path(__file__).parent
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").casefold()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+# Ollama's own default context is a few thousand tokens and silently cuts longer prompts.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "32768"))
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "").strip()
 MAX_DOCUMENT_CHARS = 160_000
@@ -500,7 +502,16 @@ def local_model_settings() -> tuple[str, str, str]:
 
 
 def lm_studio_model_ids(payload: dict) -> list[str]:
-    return [item["id"] for item in payload.get("data", []) if isinstance(item.get("id"), str)]
+    # Embedding models are listed too but cannot answer chat requests.
+    return [
+        item["id"]
+        for item in payload.get("data", [])
+        if isinstance(item.get("id"), str) and "embed" not in item["id"].casefold()
+    ]
+
+
+def estimated_tokens(text_chars: int) -> int:
+    return text_chars // 4
 
 
 def lm_studio_headers() -> dict[str, str]:
@@ -508,10 +519,22 @@ def lm_studio_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
+def model_json_text(content: str) -> str:
+    # Reasoning models may emit <think> blocks or Markdown fences around the JSON object.
+    text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+    if not text.startswith("{") and "{" in text and "}" in text:
+        return text[text.index("{"):text.rindex("}") + 1]
+    return text
+
+
 def decode_model_json(content, label: str) -> dict:
     if not isinstance(content, str) or not content.strip():
         log_pipeline_event("model.response.empty", provider=label)
         raise HTTPException(status_code=502, detail=f"{label} returned empty or non-text response content.")
+    content = model_json_text(content)
     try:
         result = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -552,6 +575,13 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
             detail="Ollama cloud models are blocked because candidate data must stay on this machine.",
         )
     label = "LM Studio" if provider == "lmstudio" else "Ollama"
+    prompt_chars = sum(len(message.get("content", "")) for message in messages)
+    if provider == "ollama" and estimated_tokens(prompt_chars) > OLLAMA_NUM_CTX:
+        log_pipeline_event("model.context.too_small", prompt_chars=prompt_chars, num_ctx=OLLAMA_NUM_CTX)
+        raise HTTPException(
+            status_code=413,
+            detail=f"The text is too long for the model context ({OLLAMA_NUM_CTX} tokens). Raise OLLAMA_NUM_CTX or review fewer pages.",
+        )
     request_started = time.perf_counter()
     log_pipeline_event(
         "model.request.start",
@@ -560,7 +590,7 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
         response_type=response_model.__name__,
         timeout_seconds=LLM_REQUEST_TIMEOUT_SECONDS,
         message_count=len(messages),
-        prompt_chars=sum(len(message.get("content", "")) for message in messages),
+        prompt_chars=prompt_chars,
     )
     try:
         async with httpx.AsyncClient(timeout=LLM_REQUEST_TIMEOUT_SECONDS, trust_env=False) as client:
@@ -571,8 +601,9 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                         "model": configured_model,
                         "messages": messages,
                         "stream": False,
-                        "format": "json",
-                        "options": {"temperature": 0.1},
+                        # A JSON schema makes Ollama constrain output to the expected structure.
+                        "format": response_model.model_json_schema(),
+                        "options": {"temperature": 0.1, "num_ctx": OLLAMA_NUM_CTX},
                     },
                 )
                 response.raise_for_status()
@@ -591,7 +622,10 @@ async def local_model_json(messages: list[dict], response_model: type[BaseModel]
                     content_chars=len(content) if isinstance(content, str) else 0,
                     prompt_tokens=upstream.get("prompt_eval_count"),
                     completion_tokens=upstream.get("eval_count"),
+                    num_ctx=OLLAMA_NUM_CTX,
                 )
+                if upstream.get("done_reason") == "length":
+                    raise HTTPException(status_code=502, detail="Ollama stopped before completing the JSON response; raise OLLAMA_NUM_CTX.")
             else:
                 model = configured_model
                 if not model:

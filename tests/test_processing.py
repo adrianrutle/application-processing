@@ -67,6 +67,13 @@ class FakeLMStudioClient:
         return FakeResponse({"choices": [{"message": {"content": '{"ok": true}'}}]})
 
 
+class FakeOllamaClient(FakeLMStudioClient):
+    async def post(self, url, headers=None, json=None):
+        self.request_url = url
+        self.request_body = json
+        return FakeResponse({"message": {"content": '{"ok": true}'}, "done_reason": "stop"})
+
+
 class PdfProcessingTests(unittest.TestCase):
     def make_pdf(self):
         writer = PdfWriter()
@@ -137,6 +144,45 @@ class PdfProcessingTests(unittest.TestCase):
         self.assertEqual(FakeLMStudioClient.instance.request_body["model"], "qwen-local")
         self.assertEqual(FakeLMStudioClient.instance.request_body["response_format"], {"type": "text"})
         self.assertEqual(FakeLMStudioClient.instance.get_headers["Authorization"], "Bearer test-local-key")
+
+    def test_ollama_requests_schema_output_and_larger_context(self):
+        with (
+            patch.object(app_module, "LLM_PROVIDER", "ollama"),
+            patch.object(app_module, "OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+            patch.object(app_module, "OLLAMA_NUM_CTX", 16384),
+            patch.object(app_module.httpx, "AsyncClient", FakeOllamaClient),
+        ):
+            result = asyncio.run(
+                local_model_json([{"role": "user", "content": "test"}], CriteriaResponse)
+            )
+
+        body = FakeOllamaClient.instance.request_body
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(body["format"], CriteriaResponse.model_json_schema())
+        self.assertEqual(body["options"]["num_ctx"], 16384)
+
+    def test_ollama_rejects_prompts_larger_than_its_context(self):
+        with (
+            patch.object(app_module, "LLM_PROVIDER", "ollama"),
+            patch.object(app_module, "OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+            patch.object(app_module, "OLLAMA_NUM_CTX", 100),
+            patch.object(app_module.httpx, "AsyncClient", FakeOllamaClient),
+        ):
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(local_model_json([{"role": "user", "content": "x" * 1000}], CriteriaResponse))
+        self.assertEqual(error.exception.status_code, 413)
+        self.assertIn("OLLAMA_NUM_CTX", error.exception.detail)
+
+    def test_model_json_decoder_strips_reasoning_and_fences(self):
+        self.assertEqual(
+            decode_model_json('<think>plan the answer</think>\n```json\n{"ok": true}\n```', "LM Studio"),
+            {"ok": True},
+        )
+        self.assertEqual(decode_model_json('Here is the JSON: {"ok": true}', "LM Studio"), {"ok": True})
+
+    def test_lm_studio_model_ids_skip_embedding_models(self):
+        payload = {"data": [{"id": "text-embedding-nomic"}, {"id": "qwen2.5-14b-instruct"}]}
+        self.assertEqual(lm_studio_model_ids(payload), ["qwen2.5-14b-instruct"])
 
     def test_lm_studio_status_reports_discovered_model_ready(self):
         with (
